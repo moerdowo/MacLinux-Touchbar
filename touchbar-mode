@@ -70,6 +70,21 @@ mode_display() {
   fi
 
   local iface="$name$DISPLAY_IF_SUFFIX" try
+
+  # If appletbdrm is already bound, rebind it through a drain rather than
+  # leaving it alone. The protocol is one request, one response; a transfer
+  # that times out has its response arrive late and sit in the endpoint queue,
+  # and from then on every read returns the *previous* request's reply. The
+  # driver logs "Response timestamp doesn't match" and never resyncs, so a
+  # stream that went out of step once stays out of step across restarts --
+  # which is exactly what "restart dfrd and it is still broken" looks like.
+  # Draining is the only way back, and it needs the interface unbound.
+  if [ -e "/sys/bus/usb/drivers/appletbdrm/$iface" ]; then
+    echo "touchbar-mode: rebinding to clear any stale responses"
+    echo "$iface" > /sys/bus/usb/drivers/appletbdrm/unbind 2>/dev/null || true
+    sleep 1
+  fi
+
   for try in 1 2 3 4; do
     [ -e "/sys/bus/usb/drivers/appletbdrm/$iface" ] && break
     drain

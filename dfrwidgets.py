@@ -23,6 +23,10 @@ STRIP_W, STRIP_H = 2170, 60
 #: Nothing is allowed to shrink below this: a 4px widget is just a glitch.
 MIN_WIDGET_W = 26.0
 
+#: Brightness steps an LED cell is drawn in. Fine enough to be invisible,
+#: coarse enough that an unchanged column really is bit-identical.
+CELL_STEPS = 64.0
+
 
 # --- schema helpers -----------------------------------------------------
 
@@ -122,6 +126,17 @@ class Widget:
 
     def tick_interval(self):
         """Seconds between forced repaints when no feed drives the widget."""
+        return None
+
+    def damage(self):
+        """Sub-rect of this widget whose pixels changed in the last draw.
+
+        None means "assume all of it", which is right for anything that
+        redraws a whole small widget. A widget spanning the strip is a
+        different matter: pushing its damage rect costs more than drawing it,
+        so one that can say which part moved should. Returning an empty rect
+        means nothing changed and the flush can be skipped entirely.
+        """
         return None
 
     def natural_width(self, ctx, env):
@@ -1194,6 +1209,11 @@ class KittWidget(Widget):
               help='Every frame is a USB transfer; 30 is smooth and cheap'),
     ]
 
+    def __init__(self, spec):
+        super().__init__(spec)
+        self._previous = None
+        self._damage = None
+
     def feeds(self):
         return [('audio', {'bands': int(self.num('bands', 48)),
                            'gain': int(self.num('gain', 0)),
@@ -1268,6 +1288,12 @@ class KittWidget(Widget):
         cell_h = h / rows
         gap_y = min(3.0, cell_h * 0.22)
 
+        previous = self._previous
+        if previous is not None and len(previous) != count:
+            previous = None              # geometry changed; nothing comparable
+        columns_now = []
+        first = last = None
+
         centre_grow = self.prop('grow', 'center') == 'center'
         # In centre-growth a column has (rows+1)//2 distinct steps, because the
         # rows pair up either side of the middle one.
@@ -1282,6 +1308,7 @@ class KittWidget(Widget):
             value = columns[ci] if scan is None else 0.0
             peak = peak_columns[ci] if (peak_columns and scan is None) else None
             cx = x + ci * cell_w
+            signature = []
             for ri in range(rows):
                 distance = abs(ri - middle)
                 # 0 at the middle row, or 0 at the floor.
@@ -1311,11 +1338,45 @@ class KittWidget(Widget):
                         if abs(step - int(peak * levels)) < 0.5:
                             lit, is_peak = 1.0, True
 
-                colour = self._ramp(base, heat, lit, peak=is_peak)
+                # Quantised, and then *drawn* from the quantised values. The
+                # signature below is what decides whether this column gets
+                # pushed to the panel, so it has to describe the pixels
+                # exactly: rounding only the comparison would leave changes
+                # under half a step on screen but unflushed, which is a stale
+                # display that no amount of staring at the draw code explains.
+                lit_q = int(lit * CELL_STEPS + 0.5)
+                heat_q = int(max(0.0, min(1.0, heat)) * CELL_STEPS + 0.5)
+                signature.append((lit_q, heat_q, is_peak))
+
+                colour = self._ramp(base, heat_q / CELL_STEPS,
+                                    lit_q / CELL_STEPS, peak=is_peak)
                 T.set_source(ctx, colour)
                 ctx.rectangle(cx + gap_x / 2, y + ri * cell_h + gap_y / 2,
                               max(1.0, cell_w - gap_x), max(1.0, cell_h - gap_y))
                 ctx.fill()
+
+            column = tuple(signature)
+            if previous is not None and ci < len(previous) and previous[ci] == column:
+                pass
+            else:
+                first = ci if first is None else first
+                last = ci
+            columns_now.append(column)
+
+        self._previous = columns_now
+        if first is None:
+            # Nothing moved. Common while paused, and the whole strip is 368 KB
+            # to push, so it is worth not pushing it.
+            self._damage = (self.x, self.y, 0.0, 0.0)
+        else:
+            left = x + first * cell_w
+            right = x + (last + 1) * cell_w
+            self._damage = (max(self.x, left - 1.0), self.y,
+                            min(self.x + self.w, right + 1.0) - max(self.x, left - 1.0),
+                            self.h)
+
+    def damage(self):
+        return self._damage
 
     # -- the idle sweep -------------------------------------------------
 

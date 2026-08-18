@@ -55,6 +55,8 @@ LONG_PRESS = 0.55            # seconds before a press counts as a long press
 SWIPE_MIN = 260              # px of travel that counts as a page swipe
 TICK = 0.05                  # render loop period, when nothing wants faster
 FAST_TICK = 1.0 / 60         # floor, so an animated widget cannot spin the loop
+SLOW_TICK = 0.20             # however slow the panel is, still redraw this often
+FLUSH_SMOOTHING = 0.25       # how fast the measured flush cost follows reality
 
 
 def log(message, *, err=False):
@@ -95,6 +97,17 @@ class Daemon:
         self.dragging = False
         self.last_touch = time.monotonic()
         self.dimmed = False
+        # Frame timing, opt-in. A visualiser makes the loop's pacing visible in
+        # a way a clock never does, so there needs to be a way to see it.
+        # What a frame's damage push costs over USB, smoothed. The DFR pixel
+        # path is far slower than the bus it rides on, and asking for frames
+        # faster than it can take them does not merely drop them -- the bulk
+        # transfer times out, which costs a whole second.
+        self.flush_acc = 0.0
+        self.flush_cost = 0.0
+        self.frame_stats = ({'draw': [], 'flush': [], 'gap': [], 'last': None,
+                             'since': time.monotonic()}
+                            if os.environ.get('DFRD_FRAME_STATS') == '1' else None)
         self.running = True
         self.full_repaint = True
         self.errors = []
@@ -204,6 +217,21 @@ class Daemon:
 
     # -- rendering ------------------------------------------------------
 
+    def flush(self, *rect):
+        """Push a damage rect, and time it. Always timed, not just for stats.
+
+        Drawing and flushing fail differently: drawing is CPU in this process,
+        the flush is an ioctl that blocks until the panel has the bytes over
+        USB. Only one of them can stall for a second, and what it costs is a
+        property of the hardware and of how much of the strip changed -- so it
+        is measured and fed back into the frame rate rather than assumed.
+        """
+        if not self.tb:
+            return
+        started = time.monotonic()
+        self.tb.flush(*rect)
+        self.flush_acc += time.monotonic() - started
+
     def draw_full(self):
         env = self.env()
         T.set_source(self.ctx, self.theme.background)
@@ -216,8 +244,7 @@ class Daemon:
                 self.ctx.restore()
                 widget._last_rev = widget.revision(env)
                 widget._last_tick = time.monotonic()
-        if self.tb:
-            self.tb.flush()
+        self.flush()
         self.full_repaint = False
 
     def draw_dirty(self):
@@ -241,8 +268,14 @@ class Daemon:
             widget._last_rev = rev
             widget._last_tick = now
             widget._last_pressed = pressed_now
-            if self.tb:
-                self.tb.flush(widget.x, widget.y, widget.w, widget.h)
+            # A widget that can say which part of itself moved gets to push
+            # only that. For a strip-wide visualiser the difference is the
+            # whole cost of the frame.
+            rect = widget.damage()
+            if rect is None:
+                self.flush(widget.x, widget.y, widget.w, widget.h)
+            elif rect[2] > 0 and rect[3] > 0:
+                self.flush(*rect)
 
     def dim(self, on):
         if on == self.dimmed:
@@ -410,6 +443,45 @@ class Daemon:
 
     # -- loop -----------------------------------------------------------
 
+    def _record_frame(self, started, woke):
+        """Frame timing, when DFRD_FRAME_STATS=1. Off by default and free."""
+        stats = self.frame_stats
+        finished = time.monotonic()
+        total = (finished - started) * 1000.0
+        flush = self.flush_acc * 1000.0
+        stats['draw'].append(total - flush)
+        stats['flush'].append(flush)
+        gap = (woke - stats['last']) * 1000.0 if stats['last'] is not None else 0.0
+        if stats['last'] is not None:
+            stats['gap'].append(gap)
+        stats['last'] = woke
+
+        # Name the outliers as they happen. An average hides a one-second
+        # freeze among thirty good frames, and the freeze is the whole problem.
+        if total > 200.0 or gap > 200.0:
+            log(f'slow frame: draw {total - flush:.0f}ms flush {flush:.0f}ms '
+                f'gap-before {gap:.0f}ms')
+        if finished - stats['since'] < 5.0:
+            return
+
+        def summary(key):
+            values = sorted(stats[key])
+            if not values:
+                return 'n/a'
+            mid = values[len(values) // 2]
+            p95 = values[min(len(values) - 1, int(len(values) * 0.95))]
+            return f'p50 {mid:.1f} p95 {p95:.1f} max {values[-1]:.1f}'
+
+        frames = len(stats['draw'])
+        elapsed = finished - stats['since']
+        log(f'frames {frames / elapsed:.1f}/s over {elapsed:.0f}s | '
+            f'draw ms {summary("draw")} | flush ms {summary("flush")} | '
+            f'gap ms {summary("gap")}')
+        stats['draw'].clear()
+        stats['flush'].clear()
+        stats['gap'].clear()
+        stats['since'] = finished
+
     def frame_period(self):
         """How long the loop may sleep, given what is on screen.
 
@@ -424,6 +496,16 @@ class Daemon:
             wanted = widget.tick_interval()
             if wanted is not None:
                 period = min(period, max(FAST_TICK, float(wanted)))
+
+        # Never ask the panel for frames faster than it can swallow. The DFR
+        # pixel path here measures around 12 MB/s, and a full-strip damage rect
+        # is 368 KB, so 30fps would be asking for essentially all of it; run a
+        # link at 100% and the bulk transfers start timing out, at a second
+        # each. Holding the flush to half a frame keeps the headroom that turns
+        # "slower" into "smooth" -- and because it is measured, a page whose
+        # damage rect is small still gets the full rate.
+        if self.flush_cost > 0.0:
+            period = max(period, min(SLOW_TICK, self.flush_cost * 2.0))
         return period
 
     def run(self):
@@ -442,9 +524,20 @@ class Daemon:
             poller.register(self.digitizer.fileno(), select.POLLIN)
 
         last_config_check = 0.0
+        next_frame = time.monotonic()
         try:
             while self.running:
-                poller.poll(max(1, int(self.frame_period() * 1000)))
+                period = self.frame_period()
+                # Sleep only what is *left* of this frame, never a whole one.
+                # Polling for the full period and then doing the work made the
+                # real frame time `period + work`, so every millisecond spent
+                # drawing and pushing the damage rect over USB was added to the
+                # gap before the next frame -- which is both slower than asked
+                # for and, because the work varies, visibly uneven. A
+                # visualiser shows that as stutter; a clock never would, which
+                # is why it survived this long.
+                wait = next_frame - time.monotonic()
+                poller.poll(max(0, int(wait * 1000)) if wait > 0 else 0)
                 now = time.monotonic()
 
                 if self.digitizer:
@@ -471,10 +564,33 @@ class Daemon:
                         now - self.last_touch > dim_after:
                     self.dim(True)
 
+                # Woken early by touch or IPC: those are handled above, but the
+                # frame is not due yet and drawing now would only make the next
+                # gap longer.
+                if now < next_frame and not self.full_repaint:
+                    continue
+
+                # Behind by more than a frame means the work does not fit in
+                # the period; resync to now rather than trying to catch up,
+                # which would fire several frames back to back and then stall.
+                next_frame = (now + period if now - next_frame > period
+                              else next_frame + period)
+
+                started = time.monotonic()
+                self.flush_acc = 0.0
                 if self.full_repaint:
                     self.draw_full()
                 else:
                     self.draw_dirty()
+                # Follow the real cost, but jump straight to a bad one. A
+                # transfer that timed out has already cost the second; easing
+                # toward it would spend several more before the rate backs off.
+                if self.flush_acc > self.flush_cost:
+                    self.flush_cost = self.flush_acc
+                else:
+                    self.flush_cost += (self.flush_acc - self.flush_cost) * FLUSH_SMOOTHING
+                if self.frame_stats is not None:
+                    self._record_frame(started, now)
         finally:
             self.shutdown()
 
