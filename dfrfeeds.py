@@ -485,6 +485,9 @@ class AudioFeed(Feed):
         self._floor = None
         self._floor_candidate = None
         self._floor_rotated = 0.0
+        # What we actually attached to, once known. Reported in status so a
+        # wrong device is visible rather than merely plausible.
+        self.source_name = None
         # Auto-gain, in dB. The sink monitor is *post-volume*: at 24% system
         # volume -- which is where this machine actually sits -- a track that
         # sounds normal measures around -50 dBFS, and a fixed window put the
@@ -519,16 +522,66 @@ class AudioFeed(Feed):
             raise RuntimeError('no default sink (is PipeWire running?)')
         return f'{name}.monitor'
 
+    def _attached_source(self, pid):
+        """Which source our capture actually landed on, by PID.
+
+        Asked rather than assumed, because getting this wrong is silent and
+        looks like success -- see `_start`.
+        """
+        rc, out, _ = self.hub.session.run(['pactl', 'list', 'source-outputs'])
+        if rc != 0:
+            return None
+        want = f'application.process.id = "{pid}"'
+        for block in (out or '').split('Source Output #'):
+            if want not in block:
+                continue
+            source_id = None
+            for line in block.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('Source:'):
+                    source_id = stripped.split(':', 1)[1].strip()
+            if source_id is None:
+                return None
+            rc, short, _ = self.hub.session.run(['pactl', 'list', 'short', 'sources'])
+            for line in (short or '').splitlines():
+                bits = line.split()
+                if len(bits) >= 2 and bits[0] == source_id:
+                    return bits[1]
+            return None
+        return None
+
     def _start(self):
         source = self._source()
-        argv = ['pw-record', '--target', source,
-                '--rate', str(AUDIO_RATE), '--channels', '1',
-                '--format', 's16', '-']
+        # parec, not pw-record. `pw-record --target <sink>.monitor` does not
+        # fail on a name it cannot resolve -- it quietly falls back to the
+        # default *capture* device, which is the built-in microphone. The
+        # visualiser then still moves, because the microphone can hear the
+        # speakers, so it looks like it works while measuring nothing about
+        # the output at all. No form of pw-record tested here reaches the
+        # monitor: not the sink node name, not its id, not stream.capture.sink.
+        # parec speaks PulseAudio names, where a monitor is a source in its own
+        # right, and lands on it.
+        if not shutil.which('parec'):
+            raise RuntimeError('parec not found (install pipewire-pulse); '
+                               'pw-record cannot capture a sink monitor')
+        argv = ['parec', '-d', source, f'--rate={AUDIO_RATE}',
+                '--channels=1', '--format=s16le', '--raw']
         self._proc = self.hub.session.stream(argv)
+
+        # And then check where it landed. Capturing the wrong device is the one
+        # failure here that still produces a convincing picture, so it is worth
+        # a round trip to refuse it out loud.
+        landed = self._attached_source(self._proc.pid)
+        if landed and not landed.endswith('.monitor'):
+            self.close()
+            raise RuntimeError(f'capture attached to {landed}, which is an '
+                               f'input, not this machine\'s output')
+
+        self.source_name = landed or source
         self._thread = threading.Thread(target=self._reader, name='dfrd-audio',
                                         daemon=True)
         self._thread.start()
-        return source
+        return self.source_name
 
     # -- capture --------------------------------------------------------
 
@@ -685,6 +738,7 @@ class AudioFeed(Feed):
                 'rms': 0.0 if silent else round(rms, 6),
                 'silent': silent,
                 'gain_db': round(self._agc, 1),
+                'source': self.source_name,
                 'floor': round(floor or 0.0, 6),
                 'count': self.bands,
                 'at': 0.0 if silent else now,

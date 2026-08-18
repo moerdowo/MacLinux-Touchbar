@@ -81,13 +81,21 @@ class Session:
     # -- running things -------------------------------------------------
 
     def _demote(self):
+        """Drop to the target user in the child, and nothing else.
+
+        Note what is *not* here: os.setsid(). CPython makes the child a session
+        leader itself when start_new_session=True, and it does that before
+        calling preexec_fn -- so a setsid() here is the second one, fails with
+        EPERM, and takes the whole spawn down with "Exception occurred in
+        preexec_fn". Every caller below asks for start_new_session instead,
+        which is the same result by the supported route.
+        """
         uid, gid, name = self.uid, self.gid, self.name
 
         def preexec():
             os.setgid(gid)
             os.initgroups(name, gid)
             os.setuid(uid)
-            os.setsid()
         return preexec
 
     def run(self, argv, *, capture=True, timeout=_TIMEOUT, shell=False):
@@ -97,6 +105,7 @@ class Session:
             'cwd': self.home,
             'timeout': timeout,
             'shell': shell,
+            'start_new_session': True,
         }
         if os.getuid() == 0:
             kwargs['preexec_fn'] = self._demote()
