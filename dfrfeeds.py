@@ -905,9 +905,22 @@ class FeedHub:
         return snapshot
 
     def revision(self, kind, **params):
+        """Whether a feed has changed since last asked. Counts as a read.
+
+        Marking this as interest matters: the render loop asks every widget
+        for its revision on every pass, but only *draws* the ones that changed,
+        and drawing is what calls get(). A widget that is up to date and stays
+        up to date -- the visualiser once it has gone dark -- would otherwise
+        let its feed go idle and be retired out from under it, taking the audio
+        capture with it. Nothing would then be left to notice a sound, so the
+        strip could never come back.
+        """
         with self._lock:
             feed = self._feeds.get(Feed.make_key(kind, params))
-            return feed.revision if feed else -1
+            if feed is None:
+                return -1
+            feed.last_read = time.monotonic()
+            return feed.revision
 
     def pump(self):
         """Submit any feed that is due. Cheap; call once per render tick."""
