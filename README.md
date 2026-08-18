@@ -57,8 +57,9 @@ so moving output to headphones does not freeze it.
 $ dfrctl page kitt
 ```
 
-Mirrored from the centre with the **bass in the middle**, pulsing outward,
-drawn as discrete red cells with the unlit ones still visible — that grid is the point, and it is where the name comes from. Escape keeps its usual block at the far left, lit in the
+Mirrored about the centre with the **bass at the two outer ends** and the
+treble meeting in the middle, drawn as discrete red cells with the unlit ones
+still visible — that grid is the point, and it is where the name comes from. Escape keeps its usual block at the far left, lit in the
 matrix's own colour, because in display mode Escape is drawn by dfrd or it
 does not exist at all.
 
