@@ -57,9 +57,8 @@ so moving output to headphones does not freeze it.
 $ dfrctl page kitt
 ```
 
-Mirrored about the centre with the **bass at the two outer ends** and the
-treble meeting in the middle, drawn as discrete red cells with the unlit ones
-still visible — that grid is the point, and it is where the name comes from. Escape keeps its usual block at the far left, lit in the
+Mirrored from the centre with the **bass in the middle**, pulsing outward,
+drawn as discrete red cells with the unlit ones still visible — that grid is the point, and it is where the name comes from. Escape keeps its usual block at the far left, lit in the
 matrix's own colour, because in display mode Escape is drawn by dfrd or it
 does not exist at all.
 
@@ -143,6 +142,18 @@ mostly about the one thing this hardware makes dangerous: the Escape key.
 
 ## Install
 
+First the driver — [appletbdrm-t1](https://github.com/moerdowo/appletbdrm-t1),
+the in-tree `appletbdrm` patched for the T1 and packaged for DKMS. Without it
+the strip draws but updates about three times a second; see *How it works*.
+
+```sh
+git clone https://github.com/moerdowo/appletbdrm-t1
+cd appletbdrm-t1 && sudo ./install.sh
+modinfo -n appletbdrm      # must be under updates/dkms
+```
+
+Then dfrd itself:
+
 ```sh
 git clone https://github.com/moerdowo/MacLinux-Touchbar
 cd MacLinux-Touchbar
@@ -199,11 +210,25 @@ T2-specific; only its ID table was. The T1 answers `GINF` with the **identical
 | pixel format | `0x52474241` |
 | physical size | 9.954″ × 0.275″ |
 
-So no driver patch is needed — just teach the running driver the ID:
+The stock driver will therefore bind and put a picture on the strip once it
+knows the ID:
 
 ```sh
 echo "05ac 8600 10" > /sys/bus/usb/drivers/appletbdrm/new_id
 ```
+
+What it will not do is *update* that picture. A T1 sends a short echo of the
+request header ahead of the real response to every request and a T2 does not,
+so upstream reads one message behind from the first request onward: the panel
+accepts about **three damage pushes a second** whatever rate is asked of it,
+and `dmesg` carries ~110 error lines a minute for as long as anything draws. A
+clock looks perfectly fine like that. An animation does not.
+
+That is fixed in the driver rather than worked around here —
+[**appletbdrm-t1**](https://github.com/moerdowo/appletbdrm-t1), the same driver
+plus the echo handling and the T1 ID, packaged for DKMS. It measures 19.1
+pushes a second against a requested 20, with no kernel errors. Install it
+first; everything below still works without it, just slowly.
 
 Three gotchas cost real time, all handled here:
 
@@ -211,7 +236,9 @@ Three gotchas cost real time, all handled here:
   session (a 16-byte echo of the request header, `02 00 12 15 …`).
   `appletbdrm`'s probe reads a fixed 65 bytes and fails on anything else, which
   makes every *other* bind fail with `Actual size (52)`. `dfrdrain.py` flushes
-  it first.
+  it first, and `touchbar-mode` rebinds through a drain every time it enters
+  display mode. With `appletbdrm-t1` there is nothing left to drain, but the
+  flush is harmless and stays for the stock driver.
 * **logind gives the card away.** The DRM master on the strip is
   `systemd-logind`, not the compositor: aquamarine asks libseat, logind opens
   the node and takes master, and Hyprland merely holds the passed fds. Since

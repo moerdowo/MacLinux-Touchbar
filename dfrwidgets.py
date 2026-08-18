@@ -1179,11 +1179,10 @@ class KittWidget(Widget):
     bar. Drawing the unlit cells is the point; a gradient with no grid reads as
     a progress bar, and the grid is what makes it read as hardware.
 
-    Mirrored about the centre by default, with the bass at the two outer ends
-    and the treble meeting in the middle. On a strip 2170px wide and 60 tall
-    that puts the loudest, slowest-moving part of the signal at the far edges,
-    where it reads as the strip breathing, and leaves the fine detail in the
-    middle where there is room for it.
+    Mirrored from the centre by default, with bass in the middle. That puts the
+    kick drum where the eye already is on a strip 2170px wide and 60 tall, and
+    it makes the display symmetric about the point the user looks at rather
+    than sweeping their attention to one end.
     """
     TYPE, LABEL, ICON = 'kitt', 'KITT visualiser', 'music'
     CATEGORY = 'Live data'
@@ -1280,10 +1279,9 @@ class KittWidget(Widget):
     def _columns(self, values):
         if not self.flag('mirror', True):
             return list(values)
-        # Forward on the left, reversed on the right: band 0 lands at both
-        # outer ends, so the bass drives the two edges and the treble detail
-        # meets in the middle.
-        return list(values) + list(reversed(values))
+        # Reversed on the left, forward on the right: band 0 lands either side
+        # of the centre line, so bass pulses out from the middle.
+        return list(reversed(values)) + list(values)
 
     def draw_content(self, ctx, env):
         data = env.feed(*self.feeds()[0][:1], **self.feeds()[0][1])
