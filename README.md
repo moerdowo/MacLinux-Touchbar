@@ -1,4 +1,6 @@
-# dfrd — the Apple T1 Touch Bar, and an app to design it
+# Dfrd - MacLinux Touchbar
+
+*The Apple T1 Touch Bar, and an app to design it.*
 
 Turns the Touch Bar on a **MacBookPro13,3** (2016, T1/iBridge `05ac:8600`)
 into a 2170×60 framebuffer you can put anything on — custom buttons, images,
@@ -10,6 +12,9 @@ dfr-editor        design it
 dfrd              run it
 dfrctl            drive it from scripts
 ```
+
+The programs keep the short `dfr*` names throughout — `dfrd` is the daemon,
+and `~/.config/dfrd/` is where its config lives.
 
 ![Four pages on the Touch Bar](docs/strip-pages.png)
 
@@ -66,6 +71,8 @@ mostly about the one thing this hardware makes dangerous: the Escape key.
 ## Install
 
 ```sh
+git clone https://github.com/moerdowo/MacLinux-Touchbar
+cd MacLinux-Touchbar
 sudo ./install.sh          # /usr/local, udev rule, service unit (not enabled)
 sudo ./install.sh --polkit # also the polkit action for mode switching
 ```
