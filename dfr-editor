@@ -38,6 +38,7 @@ from dfrsession import Session                         # noqa: E402
 
 APP_ID = 'io.github.moerdowo.dfrd.editor'
 LANE_LABELS = {'left': 'Left', 'center': 'Centre', 'right': 'Right'}
+DRAG_THRESHOLD = 6      # px of travel before a press counts as a drag
 
 CSS = """
 .strip-frame {
@@ -84,6 +85,11 @@ class Document:
         self._undo.append(json.dumps(self.config))
         del self._undo[:-60]
         self._redo.clear()
+
+    def drop_snapshot(self):
+        """Undo the undo entry: for actions that turned out to change nothing."""
+        if self._undo:
+            self._undo.pop()
 
     def changed(self, structural=True):
         self.dirty = True
@@ -143,14 +149,21 @@ class Document:
         return True
 
     def move_widget(self, widget_id, lane, index):
+        """Move a widget. Returns False when the move is a no-op, so that a
+        click that never really dragged does not dirty the document."""
         page, old_lane, old_index, spec = self.find(widget_id)
         if page is None:
             return False
-        page[old_lane].pop(old_index)
         if lane == old_lane and index > old_index:
             index -= 1
-        target = page.setdefault(lane, [])
-        target.insert(max(0, min(index, len(target))), spec)
+        # Room in the destination lane, counting the pop that is about to
+        # happen when the widget is leaving the lane it is already in.
+        room = len(page.get(lane, [])) - (1 if lane == old_lane else 0)
+        index = max(0, min(index, room))
+        if lane == old_lane and index == old_index:
+            return False
+        page[old_lane].pop(old_index)
+        page.setdefault(lane, []).insert(index, spec)
         return True
 
     def duplicate_widget(self, widget_id):
@@ -175,6 +188,7 @@ class StripPreview(Gtk.DrawingArea):
         self.widgets = []
         self.drag_id = None
         self.drag_pos = None
+        self.drag_active = False        # past DRAG_THRESHOLD, i.e. a real drag
         self.drop_hint = None
         self.set_content_height(int(W.STRIP_H * 0.9))
         self.set_hexpand(True)
@@ -228,7 +242,7 @@ class StripPreview(Gtk.DrawingArea):
             return
         self.widgets = W.render_page(ctx, window.doc.config, page, env)
 
-        if self.drag_id and self.drop_hint:
+        if self.drag_active and self.drop_hint:
             lane, x_pos = self.drop_hint
             T.set_source(ctx, T.parse_color('#4c8dff'))
             ctx.rectangle(x_pos - 1.5, 2, 3, W.STRIP_H - 4)
@@ -237,7 +251,7 @@ class StripPreview(Gtk.DrawingArea):
 
         # Lane guides while dragging, so "which group am I dropping into" is
         # answerable without reading any documentation.
-        if self.drag_id:
+        if self.drag_active:
             for i in range(1, 3):
                 x_pos = width * i / 3
                 ctx.set_source_rgba(1, 1, 1, 0.14)
@@ -292,13 +306,20 @@ class StripPreview(Gtk.DrawingArea):
         widget = self.widget_at(x, y)
         self.drag_id = widget.id if widget else None
         self.drag_pos = (x, y)
+        self.drag_active = False
         if self.drag_id:
             self.window.select(self.drag_id)
-            self.set_cursor(Gdk.Cursor.new_from_name('grabbing', None))
 
     def _on_drag_update(self, gesture, dx, dy):
         if not self.drag_id or not self.drag_pos:
             return
+        # GtkGestureDrag recognises on press, so every click arrives here as a
+        # zero-distance drag. Only past the threshold is it a reorder.
+        if not self.drag_active:
+            if max(abs(dx), abs(dy)) < DRAG_THRESHOLD:
+                return
+            self.drag_active = True
+            self.set_cursor(Gdk.Cursor.new_from_name('grabbing', None))
         x = self.drag_pos[0] + dx
         lane = self.lane_at(x)
         index = self.insert_index(lane, x)
@@ -319,7 +340,7 @@ class StripPreview(Gtk.DrawingArea):
         self.queue_draw()
 
     def _on_drag_end(self, gesture, dx, dy):
-        if self.drag_id and self.drag_pos:
+        if self.drag_active and self.drag_id and self.drag_pos:
             x = self.drag_pos[0] + dx
             lane = self.lane_at(x)
             index = self.insert_index(lane, x)
@@ -329,7 +350,10 @@ class StripPreview(Gtk.DrawingArea):
             self.window.doc.snapshot()
             if self.window.doc.move_widget(moved_id, lane, index):
                 self.window.doc.changed()
+            else:
+                self.window.doc.drop_snapshot()
         self.drag_id = None
+        self.drag_active = False
         self.drop_hint = None
         self.set_cursor(Gdk.Cursor.new_from_name('default', None))
         self.queue_draw()
@@ -408,6 +432,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.doc = doc
         self.doc.connect(self._on_doc_changed)
         self.selected_id = None
+        self._refreshing = False
         self.page_id = doc.pages()[0]['id'] if doc.pages() else None
         self.client = dfripc.Client()
         self.live = False
@@ -643,25 +668,43 @@ class EditorWindow(Adw.ApplicationWindow):
     # -- reactions ------------------------------------------------------
 
     def _on_doc_changed(self, structural):
-        self._refresh_all()
+        # A non-structural change comes from a row in the panel that is still
+        # on screen and quite possibly still being typed into. Rebuilding the
+        # panel there would destroy that entry mid-keystroke and throw focus
+        # back to the top of the window, so only refresh what cannot have
+        # moved: the Save label and the strip itself.
+        if structural:
+            self._refresh_all()
+        else:
+            self._refresh_light()
         if self.live:
             self._schedule_push()
+
+    def _refresh_light(self):
+        self.save_button.set_label('Save*' if self.doc.dirty else 'Save')
+        self.preview.queue_draw()
 
     def _refresh_all(self):
         pages = self.doc.pages()
         names = [p.get('name', p.get('id', '?')) for p in pages] or ['—']
-        current = self.page_dropdown.get_selected()
-        self.page_dropdown.set_model(Gtk.StringList.new(names))
-        index = next((i for i, p in enumerate(pages) if p.get('id') == self.page_id), 0)
-        self.page_dropdown.set_selected(index if index < len(names) else 0)
+        # set_model() resets the selection to 0 and set_selected() emits too,
+        # so both would arrive as "the user chose a page" and reset the
+        # selection to the first widget. Refreshing the list is not a choice.
+        self._refreshing = True
+        try:
+            self.page_dropdown.set_model(Gtk.StringList.new(names))
+            index = next((i for i, p in enumerate(pages)
+                          if p.get('id') == self.page_id), 0)
+            self.page_dropdown.set_selected(index if index < len(names) else 0)
+        finally:
+            self._refreshing = False
         if pages and (self.page_id is None or
                       not any(p.get('id') == self.page_id for p in pages)):
             self.page_id = pages[0]['id']
-        self.save_button.set_label('Save*' if self.doc.dirty else 'Save')
         self._rebuild_properties()
         self._rebuild_theme_page()
         self._rebuild_settings_page()
-        self.preview.queue_draw()
+        self._refresh_light()
 
     def _tick(self):
         self.hub.pump()
@@ -748,6 +791,8 @@ class EditorWindow(Adw.ApplicationWindow):
     # -- page actions ---------------------------------------------------
 
     def _on_page_selected(self, dropdown, _param):
+        if self._refreshing:
+            return
         pages = self.doc.pages()
         index = dropdown.get_selected()
         if 0 <= index < len(pages):

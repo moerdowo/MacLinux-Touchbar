@@ -175,6 +175,26 @@ def all_keycodes():
 _HIDIOCGRDESCSIZE = (2 << 30) | (4 << 16) | (ord('H') << 8) | 0x01
 
 
+def _is_ibridge(uevent):
+    """True when this HID device is the iBridge (05ac:8600).
+
+    The kernel writes HID_ID zero-padded to eight hex digits, as
+    `HID_ID=0003:000005AC:00008600`, so a substring test for '05AC:8600'
+    never matches anything. Parse the field instead.
+    """
+    for line in uevent.splitlines():
+        if not line.startswith('HID_ID='):
+            continue
+        parts = line.split('=', 1)[1].split(':')
+        if len(parts) != 3:
+            return False
+        try:
+            return (int(parts[1], 16), int(parts[2], 16)) == (0x05AC, 0x8600)
+        except ValueError:
+            return False
+    return False
+
+
 def find_digitizer():
     """Return the hidraw path of the Touch Bar digitizer, or None.
 
@@ -188,7 +208,7 @@ def find_digitizer():
             uevent = open(os.path.join(dev, 'uevent')).read()
         except OSError:
             continue
-        if '05AC:8600' not in uevent.upper():
+        if not _is_ibridge(uevent):
             continue
         try:
             rdesc = open(os.path.join(dev, 'report_descriptor'), 'rb').read(6)

@@ -22,11 +22,24 @@ ENCODING = 'utf-8'
 MAX_MESSAGE = 4 * 1024 * 1024        # a whole config, comfortably
 
 
-def socket_path():
-    """Prefer /run; fall back to /tmp when /run is not writable."""
-    if os.path.isdir('/run') and os.access('/run', os.W_OK):
-        return SOCKET_PATH
-    return FALLBACK_SOCKET
+def socket_path(create=False):
+    """Where the control socket lives.
+
+    A server needs somewhere it can *create* the socket, so it asks whether
+    /run is writable. A client only needs to find one somebody else already
+    created -- and /run is not writable by the desktop user the editor runs
+    as, which is the normal case, not the exception. Asking the server's
+    question on the client side sent the editor looking in /tmp for a socket
+    the root daemon had bound in /run, and it reported the daemon offline.
+    """
+    if create:
+        if os.path.isdir('/run') and os.access('/run', os.W_OK):
+            return SOCKET_PATH
+        return FALLBACK_SOCKET
+    for path in (SOCKET_PATH, FALLBACK_SOCKET):
+        if os.path.exists(path):
+            return path
+    return SOCKET_PATH
 
 
 def _send_json(sock, payload):
@@ -53,7 +66,7 @@ class Server:
     """Accepts control connections and queues requests for the render loop."""
 
     def __init__(self, path=None, owner_uid=None, owner_gid=None):
-        self.path = path or socket_path()
+        self.path = path or socket_path(create=True)
         self.owner = (owner_uid, owner_gid)
         self.requests = queue.Queue()
         self._sock = None
@@ -137,8 +150,14 @@ class Client:
     """Thin synchronous client. Every call returns a dict with `ok`."""
 
     def __init__(self, path=None, timeout=6.0):
-        self.path = path or socket_path()
+        self._path = path
         self.timeout = timeout
+
+    @property
+    def path(self):
+        # Resolved per call, never cached: the editor is commonly running
+        # before the daemon is started, and must notice when it appears.
+        return self._path or socket_path()
 
     def available(self):
         return os.path.exists(self.path)

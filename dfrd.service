@@ -4,10 +4,15 @@ Documentation=file:/usr/local/lib/dfrd/README.md
 # The daemon needs the user's session to launch apps, read MPRIS and talk to
 # Hyprland, so it is pointless before one exists.
 After=graphical.target systemd-user-sessions.service
-ConditionPathExists=/sys/bus/usb/drivers/appletbdrm
+# Guard on the *hardware*, not on appletbdrm's driver directory: that
+# directory only exists once the module is loaded, and the thing that
+# loads it is ExecStartPre below -- so keying a condition off it meant
+# the unit silently skipped itself on every boot.
 
 [Service]
 Type=simple
+# Skip cleanly (not fail) when there is no iBridge -- 05ac:8600.
+ExecCondition=/bin/sh -c 'grep -qsx 8600 /sys/bus/usb/devices/*/idProduct'
 # Put the strip into display mode first, and always hand it back afterwards.
 # Config 2 has no keyboard interface, so a stopped daemon that left the strip
 # in display mode would be a laptop with no Escape key.
