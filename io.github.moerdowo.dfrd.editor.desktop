@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Touch Bar
+GenericName=Touch Bar designer
+Comment=Design what the Apple Touch Bar shows: buttons, images and live widgets
+Exec=dfr-editor
+Icon=preferences-desktop-keyboard
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=touchbar;dfr;macbook;strip;
+StartupNotify=true
+StartupWMClass=io.github.moerdowo.dfrd.editor

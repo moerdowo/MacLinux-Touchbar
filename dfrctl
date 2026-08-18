@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""dfrctl -- command line control for the Touch Bar.
+
+Follows the same rule as the rest of this project's helpers: every subcommand
+prints JSON and exits 0 wherever a caller might be a status poller, so a panel
+or a script never has to parse an error message or handle a non-zero exit to
+find out that something is simply unavailable.
+
+    dfrctl status              hardware + daemon state, JSON
+    dfrctl mode display        switch the strip into display mode (root)
+    dfrctl mode keyboard       hand it back to the firmware (root)
+    dfrctl page media          switch the running daemon to a page
+    dfrctl reload              re-read the config file
+    dfrctl screenshot out.png  what the strip shows right now
+    dfrctl widgets             the widget catalogue, JSON
+    dfrctl icons               the icon catalogue, JSON
+"""
+
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import dfrconfig                                       # noqa: E402
+import dfripc                                          # noqa: E402
+import dfrinput as di                                  # noqa: E402
+import dfrtheme as T                                   # noqa: E402
+import dfrwidgets as W                                 # noqa: E402
+import dfractions as A                                 # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOUCHBAR_MODE = os.path.join(HERE, 'touchbar-mode')
+
+
+def emit(payload, pretty=True):
+    print(json.dumps(payload, indent=2 if pretty else None, ensure_ascii=False))
+    return 0
+
+
+def hardware_status():
+    try:
+        out = subprocess.run([TOUCHBAR_MODE, 'status'], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+        return json.loads(out) if out.startswith('{') else {'supported': False}
+    except Exception as exc:                           # noqa: BLE001
+        return {'supported': False, 'error': str(exc)}
+
+
+def cmd_status(args):
+    client = dfripc.Client()
+    daemon = client.status() if client.available() else {'ok': False,
+                                                         'error': 'not running'}
+    config_path = dfrconfig.config_path()
+    cfg, problems = dfrconfig.load(config_path)
+    return emit({
+        'hardware': hardware_status(),
+        'daemon': daemon,
+        'config': {
+            'path': config_path,
+            'exists': os.path.exists(config_path),
+            'pages': [{'id': p['id'], 'name': p['name'],
+                       'widgets': sum(len(p.get(l, [])) for l in dfrconfig.LANES)}
+                      for p in cfg.get('pages', [])],
+            'problems': problems,
+        },
+    })
+
+
+def cmd_mode(args):
+    if args.mode == 'status':
+        return emit(hardware_status())
+    if os.getuid() != 0:
+        return emit({'ok': False,
+                     'error': f'needs root: sudo {TOUCHBAR_MODE} {args.mode}'})
+    proc = subprocess.run([TOUCHBAR_MODE, args.mode], capture_output=True, text=True)
+    return emit({'ok': proc.returncode == 0,
+                 'stdout': proc.stdout.strip(), 'stderr': proc.stderr.strip(),
+                 'state': hardware_status()})
+
+
+def cmd_page(args):
+    return emit(dfripc.Client().set_page(args.page))
+
+
+def cmd_reload(args):
+    return emit(dfripc.Client().reload())
+
+
+def cmd_screenshot(args):
+    reply = dfripc.Client().screenshot()
+    if not reply.get('ok'):
+        return emit(reply)
+    data = base64.b64decode(reply['png_base64'])
+    with open(args.path, 'wb') as fh:
+        fh.write(data)
+    return emit({'ok': True, 'path': args.path, 'bytes': len(data)})
+
+
+def cmd_widgets(args):
+    catalogue = []
+    for type_, cls in sorted(W.WIDGET_TYPES.items()):
+        catalogue.append({
+            'type': type_, 'label': cls.LABEL, 'category': cls.CATEGORY,
+            'icon': cls.ICON, 'description': cls.DESCRIPTION,
+            'interactive': cls.INTERACTIVE,
+            'default_width': cls.DEFAULT_WIDTH,
+            'properties': cls.SCHEMA,
+        })
+    return emit(catalogue)
+
+
+def cmd_icons(args):
+    return emit({'icons': sorted(T.ICONS), 'presets': sorted(T.PRESETS),
+                 'keys': {group: names for group, names in di.KEY_GROUPS},
+                 'actions': A.ACTION_LABELS})
+
+
+def cmd_validate(args):
+    path = args.path or dfrconfig.config_path()
+    cfg, problems = dfrconfig.load(path)
+    return emit({'ok': not problems, 'path': path, 'problems': problems,
+                 'pages': len(cfg.get('pages', []))})
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Touch Bar control')
+    sub = parser.add_subparsers(dest='command')
+
+    sub.add_parser('status').set_defaults(func=cmd_status)
+
+    mode = sub.add_parser('mode')
+    mode.add_argument('mode', choices=['display', 'keyboard', 'toggle', 'status'])
+    mode.set_defaults(func=cmd_mode)
+
+    page = sub.add_parser('page')
+    page.add_argument('page', help='page id, or +1 / -1')
+    page.set_defaults(func=cmd_page)
+
+    sub.add_parser('reload').set_defaults(func=cmd_reload)
+
+    shot = sub.add_parser('screenshot')
+    shot.add_argument('path', nargs='?', default='touchbar.png')
+    shot.set_defaults(func=cmd_screenshot)
+
+    sub.add_parser('widgets').set_defaults(func=cmd_widgets)
+    sub.add_parser('icons').set_defaults(func=cmd_icons)
+
+    val = sub.add_parser('validate')
+    val.add_argument('path', nargs='?')
+    val.set_defaults(func=cmd_validate)
+
+    args = parser.parse_args()
+    if not getattr(args, 'func', None):
+        return cmd_status(args)
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

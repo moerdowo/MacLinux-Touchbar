@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""dfrd -- the Apple T1 Touch Bar daemon.
+
+Owns /dev/dri/card2 (appletbdrm), renders a page of widgets with cairo, reads
+the 10-finger digitizer over hidraw and synthesises keystrokes over uinput.
+
+Because USB config 2 has no keyboard interface at all, this daemon *is* the
+Escape key on a machine with no physical function row. Two consequences shape
+the design:
+
+* An Escape key is reserved on every page unless the user explicitly turns it
+  off, and it is drawn by the daemon rather than placed in the layout, so no
+  amount of editing can remove it by accident.
+* On exit the strip is put back into keyboard mode by default, which restores
+  the firmware layouts and a real Escape key.
+
+Usage:
+    dfrd                    run
+    dfrd --headless         run everything except the panel (design without
+                            taking the strip out of keyboard mode)
+    dfrd --test             orientation test pattern
+    dfrd --probe-touch      print raw touch coordinates
+    dfrd --render out.png   render the current config to a file (no hardware)
+"""
+
+import argparse
+import base64
+import io
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import cairo                                                   # noqa: E402
+
+import dfractions                                              # noqa: E402
+import dfrconfig                                               # noqa: E402
+import dfripc                                                  # noqa: E402
+import dfrinput as di                                          # noqa: E402
+import dfrtheme as T                                           # noqa: E402
+import dfrwidgets as W                                         # noqa: E402
+from dfrfeeds import FeedHub                                   # noqa: E402
+from dfrsession import Session                                 # noqa: E402
+from dfrdrm import TouchBar, TouchBarBusy, STRIP_W, STRIP_H    # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOUCHBAR_MODE = os.path.join(HERE, 'touchbar-mode')
+
+LONG_PRESS = 0.55            # seconds before a press counts as a long press
+SWIPE_MIN = 260              # px of travel that counts as a page swipe
+TICK = 0.05                  # render loop period
+
+
+def log(message, *, err=False):
+    stream = sys.stderr if err else sys.stdout
+    print(f'dfrd: {message}', file=stream, flush=True)
+
+
+class Daemon:
+    def __init__(self, args):
+        self.args = args
+        self.user = dfrconfig.resolve_user(args.user)
+        self.config_path = args.config or dfrconfig.config_path(self.user)
+        self.session = Session(self.user)
+
+        self.config, problems = dfrconfig.load(self.config_path, self.user)
+        for problem in problems:
+            log(problem, err=True)
+        self.preview_config = None
+        self._config_mtime = self._mtime()
+
+        self.page_index = 0
+        self.theme = T.Theme(self.active_config().get('theme'))
+        self.hub = FeedHub(self.session)
+
+        self.tb = None
+        self.headless = False
+        self.keyboard = None
+        self.digitizer = None
+        self.ipc = None
+        self.runner = None
+
+        self.widgets = []
+        self._widget_state = {}
+        self.pressed = None
+        self.press_start = 0.0
+        self.press_point = (0, 0)
+        self.press_fired_long = False
+        self.dragging = False
+        self.last_touch = time.monotonic()
+        self.dimmed = False
+        self.running = True
+        self.full_repaint = True
+        self.errors = []
+
+    # -- config ---------------------------------------------------------
+
+    def active_config(self):
+        return self.preview_config or self.config
+
+    def _mtime(self):
+        try:
+            return os.path.getmtime(self.config_path)
+        except OSError:
+            return 0.0
+
+    def pages(self):
+        return self.active_config().get('pages') or [{'id': 'empty', 'name': 'Empty'}]
+
+    def current_page(self):
+        pages = self.pages()
+        self.page_index = max(0, min(self.page_index, len(pages) - 1))
+        return pages[self.page_index]
+
+    def settings(self, key, default=None):
+        return self.active_config().get('settings', {}).get(key, default)
+
+    def request_reload(self):
+        config, problems = dfrconfig.load(self.config_path, self.user)
+        for problem in problems:
+            log(problem, err=True)
+        self.config = config
+        self._config_mtime = self._mtime()
+        self.apply_config()
+        return True, 'reloaded'
+
+    def apply_config(self):
+        """Re-theme, re-lay-out and force a full repaint."""
+        self.theme = T.Theme(self.active_config().get('theme'))
+        page_id = None
+        if self._widget_state.get('page_id'):
+            page_id = self._widget_state['page_id']
+        pages = self.pages()
+        if page_id is not None:
+            for i, page in enumerate(pages):
+                if page.get('id') == page_id:
+                    self.page_index = i
+                    break
+        self.relayout()
+        self.full_repaint = True
+
+    def relayout(self):
+        page = self.current_page()
+        env = self.env()
+        self.widgets = W.layout_page(self.scratch_ctx, self.active_config(),
+                                     page, env)
+        self._widget_state = {'page_id': page.get('id')}
+        for widget in self.widgets:
+            widget._last_rev = None
+            widget._last_tick = 0.0
+
+    def env(self, **kw):
+        return W.Env(self.theme, self.hub, self.active_config(),
+                     self.current_page().get('id'),
+                     pressed_id=self.pressed.id if self.pressed else None, **kw)
+
+    # -- hardware -------------------------------------------------------
+
+    def open_hardware(self):
+        # Full-size scratch surface: it measures text during layout, and in
+        # headless mode it is also what the strip is rendered into.
+        self.scratch_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                                  STRIP_W, STRIP_H)
+        self.scratch_ctx = cairo.Context(self.scratch_surface)
+
+        self.headless = bool(self.args.headless or self.args.render)
+        if self.headless:
+            self.tb = None
+            log('headless: no panel, no touch input, control socket only')
+        else:
+            self.tb = TouchBar(self.args.card)
+
+        try:
+            self.keyboard = di.VirtualKeyboard()
+        except OSError as exc:
+            # Without uinput a key action cannot fire, but everything else --
+            # rendering, feeds, the editor's live preview -- still works.
+            self.keyboard = None
+            log(f'no virtual keyboard ({exc}); key actions disabled', err=True)
+        self.runner = dfractions.ActionRunner(self.session, self.keyboard, self)
+
+        hidraw = None if self.headless else di.find_digitizer()
+        if hidraw:
+            self.digitizer = di.Digitizer(hidraw, STRIP_W, STRIP_H,
+                                          flip_x=bool(self.settings('flip_x')),
+                                          flip_y=bool(self.settings('flip_y')))
+            log(f'digitizer on {hidraw}')
+        elif not self.headless:
+            log('no digitizer found -- display only', err=True)
+
+        self.ipc = dfripc.Server(owner_uid=self.user.pw_uid,
+                                 owner_gid=self.user.pw_gid)
+        log(f'control socket at {self.ipc.start()}')
+
+    @property
+    def ctx(self):
+        return self.tb.ctx if self.tb else self.scratch_ctx
+
+    # -- rendering ------------------------------------------------------
+
+    def draw_full(self):
+        env = self.env()
+        T.set_source(self.ctx, self.theme.background)
+        self.ctx.rectangle(0, 0, STRIP_W, STRIP_H)
+        self.ctx.fill()
+        if not self.dimmed:
+            for widget in self.widgets:
+                self.ctx.save()
+                widget.draw(self.ctx, env)
+                self.ctx.restore()
+                widget._last_rev = widget.revision(env)
+                widget._last_tick = time.monotonic()
+        if self.tb:
+            self.tb.flush()
+        self.full_repaint = False
+
+    def draw_dirty(self):
+        """Repaint only widgets whose inputs changed, flushing each rect."""
+        if self.dimmed:
+            return
+        env = self.env()
+        now = time.monotonic()
+        for widget in self.widgets:
+            rev = widget.revision(env)
+            interval = widget.tick_interval()
+            due = interval is not None and now - widget._last_tick >= interval
+            pressed_now = env.pressed_id == widget.id
+            changed = (rev != widget._last_rev or due or
+                       pressed_now != getattr(widget, '_last_pressed', False))
+            if not changed:
+                continue
+            self.ctx.save()
+            widget.draw(self.ctx, env)
+            self.ctx.restore()
+            widget._last_rev = rev
+            widget._last_tick = now
+            widget._last_pressed = pressed_now
+            if self.tb:
+                self.tb.flush(widget.x, widget.y, widget.w, widget.h)
+
+    def dim(self, on):
+        if on == self.dimmed:
+            return
+        self.dimmed = on
+        if on:
+            T.set_source(self.ctx, (0, 0, 0, 1))
+            self.ctx.rectangle(0, 0, STRIP_W, STRIP_H)
+            self.ctx.fill()
+            if self.tb:
+                self.tb.flush()
+        else:
+            self.full_repaint = True
+
+    def render_png(self, path=None):
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, STRIP_W, STRIP_H)
+        ctx = cairo.Context(surface)
+        W.render_page(ctx, self.active_config(), self.current_page(), self.env())
+        if path:
+            surface.write_to_png(path)
+            return path
+        buf = io.BytesIO()
+        surface.write_to_png(buf)
+        return base64.b64encode(buf.getvalue()).decode('ascii')
+
+    # -- actions --------------------------------------------------------
+
+    def switch_page(self, target):
+        pages = self.pages()
+        if target in ('+1', 'next'):
+            self.page_index = (self.page_index + 1) % len(pages)
+        elif target in ('-1', 'prev', 'previous'):
+            self.page_index = (self.page_index - 1) % len(pages)
+        else:
+            for i, page in enumerate(pages):
+                if page.get('id') == target or page.get('name') == target:
+                    self.page_index = i
+                    break
+            else:
+                return False, f'no such page: {target}'
+        self.relayout()
+        self.full_repaint = True
+        return True, self.current_page().get('id')
+
+    def switch_mode(self, mode):
+        """Hand the strip back to the firmware (and quit) or stay in display."""
+        if mode != 'keyboard':
+            return False, 'only keyboard mode can be requested at runtime'
+        log('mode switch requested -- exiting to keyboard mode')
+        self.running = False
+        return True, 'switching to keyboard mode'
+
+    def fire(self, action, widget=None):
+        ok, message = self.runner.run(action)
+        if not ok and message:
+            log(f'action failed: {message}', err=True)
+            self.errors = (self.errors + [message])[-10:]
+        return ok
+
+    # -- touch ----------------------------------------------------------
+
+    def hit(self, point):
+        for widget in self.widgets:
+            if widget.contains(*point):
+                return widget
+        return None
+
+    def handle_touch(self, fingers):
+        now = time.monotonic()
+        if fingers:
+            self.last_touch = now
+            if self.dimmed:
+                self.dim(False)
+                return                                 # first touch only wakes
+            point = fingers[0]
+            if self.pressed is None:
+                widget = self.hit(point)
+                self.pressed = widget
+                self.press_start = now
+                self.press_point = point
+                self.press_fired_long = False
+                self.dragging = False
+            else:
+                travel = point[0] - self.press_point[0]
+                if self.pressed.INTERACTIVE:
+                    self.dragging = True
+                    action = self.pressed.drag(self.env(), point)
+                    if action:
+                        self.fire(action, self.pressed)
+                elif (not self.press_fired_long and
+                      now - self.press_start >= LONG_PRESS and
+                      self.pressed.long_press(self.env(), point)):
+                    self.press_fired_long = True
+                    self.fire(self.pressed.long_press(self.env(), point),
+                              self.pressed)
+                elif abs(travel) >= SWIPE_MIN and self.settings('swipe_pages', True):
+                    self.switch_page('+1' if travel < 0 else '-1')
+                    self.pressed = None
+        elif self.pressed is not None:
+            widget, self.pressed = self.pressed, None
+            if not self.press_fired_long and not self.dragging:
+                action = widget.tap(self.env(), self.press_point)
+                if action:
+                    self.fire(action, widget)
+            self.dragging = False
+
+    # -- ipc ------------------------------------------------------------
+
+    def handle_request(self, request):
+        cmd = request.get('cmd')
+        if cmd == 'ping':
+            return {'ok': True, 'pid': os.getpid(),
+                    'page': self.current_page().get('id')}
+        if cmd == 'status':
+            return {'ok': True, **self.status()}
+        if cmd == 'reload':
+            self.preview_config = None
+            ok, message = self.request_reload()
+            return {'ok': ok, 'message': message}
+        if cmd == 'preview':
+            config = request.get('config')
+            if not isinstance(config, dict):
+                return {'ok': False, 'error': 'no config'}
+            validated, problems = dfrconfig.validate(config)
+            self.preview_config = validated
+            if request.get('page'):
+                for i, page in enumerate(self.pages()):
+                    if page.get('id') == request['page']:
+                        self.page_index = i
+                        break
+            self.apply_config()
+            return {'ok': True, 'problems': problems,
+                    'page': self.current_page().get('id')}
+        if cmd == 'clear_preview':
+            self.preview_config = None
+            self.apply_config()
+            return {'ok': True}
+        if cmd == 'page':
+            ok, message = self.switch_page(request.get('page', '+1'))
+            return {'ok': ok, 'page': message}
+        if cmd == 'screenshot':
+            return {'ok': True, 'png_base64': self.render_png()}
+        if cmd == 'quit':
+            self.running = False
+            return {'ok': True}
+        return {'ok': False, 'error': f'unknown command: {cmd}'}
+
+    def status(self):
+        page = self.current_page()
+        return {
+            'pid': os.getpid(),
+            'card': self.args.card,
+            'config': self.config_path,
+            'user': self.user.pw_name,
+            'preview': self.preview_config is not None,
+            'page': page.get('id'),
+            'page_name': page.get('name'),
+            'pages': [{'id': p.get('id'), 'name': p.get('name')}
+                      for p in self.pages()],
+            'widgets': len(self.widgets),
+            'digitizer': bool(self.digitizer),
+            'dimmed': self.dimmed,
+            'errors': self.errors[-5:],
+        }
+
+    # -- loop -----------------------------------------------------------
+
+    def run(self):
+        self.open_hardware()
+        self.relayout()
+        self.draw_full()
+
+        def stop(*_):
+            self.running = False
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGHUP, lambda *_: self.request_reload())
+
+        poller = select.poll()
+        if self.digitizer:
+            poller.register(self.digitizer.fileno(), select.POLLIN)
+
+        last_config_check = 0.0
+        try:
+            while self.running:
+                poller.poll(int(TICK * 1000))
+                now = time.monotonic()
+
+                if self.digitizer:
+                    fingers = self.digitizer.read()
+                    if fingers is not None:
+                        self.handle_touch(fingers)
+
+                for request, reply in self.ipc.poll():
+                    try:
+                        reply.put(self.handle_request(request))
+                    except Exception as exc:           # noqa: BLE001
+                        reply.put({'ok': False, 'error': str(exc)})
+
+                if now - last_config_check > 1.0:
+                    last_config_check = now
+                    if self.preview_config is None and self._mtime() != self._config_mtime:
+                        log('config changed on disk -- reloading')
+                        self.request_reload()
+
+                self.hub.pump()
+
+                dim_after = float(self.settings('dim_after', 0) or 0)
+                if dim_after > 0 and not self.dimmed and \
+                        now - self.last_touch > dim_after:
+                    self.dim(True)
+
+                if self.full_repaint:
+                    self.draw_full()
+                else:
+                    self.draw_dirty()
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        log('shutting down')
+        if self.ipc:
+            self.ipc.stop()
+        if self.hub:
+            self.hub.close()
+        if self.keyboard:
+            self.keyboard.close()
+        if self.tb:
+            try:
+                self.tb.close()
+            except Exception:                          # noqa: BLE001
+                pass
+        # Give the user their Escape key back. Without this the strip is left
+        # dark in a USB config that has no keyboard interface at all.
+        if self.settings('revert_on_exit', True) and not self.args.no_revert \
+                and not getattr(self, 'headless', False) \
+                and os.getuid() == 0 and os.path.exists(TOUCHBAR_MODE):
+            try:
+                subprocess.run([TOUCHBAR_MODE, 'keyboard'], timeout=30,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+                log('reverted to keyboard mode')
+            except Exception as exc:                   # noqa: BLE001
+                log(f'could not revert: {exc}', err=True)
+
+
+# --- diagnostics --------------------------------------------------------
+
+def test_pattern(args):
+    try:
+        tb = TouchBar(args.card)
+    except TouchBarBusy as exc:
+        sys.exit(f'dfrd: {exc}')
+    ctx = tb.ctx
+    bands = [(1, 0, 0), (1, .5, 0), (1, 1, 0), (0, 1, 0),
+             (0, 1, 1), (0, 0, 1), (1, 0, 1), (1, 1, 1)]
+    bw = STRIP_W / len(bands)
+    for i, (r, g, b) in enumerate(bands):
+        grad = cairo.LinearGradient(0, 0, 0, STRIP_H)
+        grad.add_color_stop_rgb(0, r, g, b)
+        grad.add_color_stop_rgb(1, r * .15, g * .15, b * .15)
+        ctx.set_source(grad)
+        ctx.rectangle(i * bw, 0, bw, STRIP_H)
+        ctx.fill()
+    T.draw_text(ctx, 'LEFT', 12, 0, 200, STRIP_H, font='Noto Sans', size=26,
+                color=(0, 0, 0, 1), weight='bold', align=T.ALIGN_LEFT)
+    T.draw_text(ctx, 'RIGHT', STRIP_W - 212, 0, 200, STRIP_H, font='Noto Sans',
+                size=26, color=(0, 0, 0, 1), weight='bold', align=T.ALIGN_RIGHT)
+    tb.flush()
+    print(f'test pattern on {args.card}; holding {args.seconds}s')
+    time.sleep(args.seconds)
+    tb.close()
+
+
+def probe_touch(args):
+    hidraw = di.find_digitizer()
+    if not hidraw:
+        sys.exit('dfrd: no digitizer (is the Touch Bar in display mode?)')
+    print(f'reading {hidraw} -- touch the strip, Ctrl-C to stop')
+    dig = di.Digitizer(hidraw, STRIP_W, STRIP_H)
+    try:
+        while True:
+            fingers = dig.read()
+            if fingers:
+                print('  ' + '  '.join(f'({x:7.1f}, {y:5.1f})' for x, y in fingers),
+                      flush=True)
+            time.sleep(0.03)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        dig.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Apple T1 Touch Bar daemon')
+    parser.add_argument('--card', default='/dev/dri/card2')
+    parser.add_argument('--config', help='config file (default: the user\'s)')
+    parser.add_argument('--user', help='whose config and session to use')
+    parser.add_argument('--headless', action='store_true',
+                        help='run without the panel or touch input')
+    parser.add_argument('--test', action='store_true')
+    parser.add_argument('--probe-touch', action='store_true')
+    parser.add_argument('--render', metavar='PNG',
+                        help='render the current config to a PNG and exit')
+    parser.add_argument('--page', help='start on this page id')
+    parser.add_argument('--no-revert', action='store_true',
+                        help='do not switch back to keyboard mode on exit')
+    parser.add_argument('--seconds', type=int, default=20)
+    args = parser.parse_args()
+
+    if args.test:
+        return test_pattern(args)
+    if args.probe_touch:
+        return probe_touch(args)
+
+    daemon = Daemon(args)
+    if args.render:
+        daemon.scratch_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                                    STRIP_W, STRIP_H)
+        daemon.scratch_ctx = cairo.Context(daemon.scratch_surface)
+        if args.page:
+            daemon.switch_page(args.page)
+        print(daemon.render_png(args.render))
+        return None
+    if args.page:
+        daemon.page_index = next(
+            (i for i, p in enumerate(daemon.pages()) if p.get('id') == args.page), 0)
+    try:
+        daemon.run()
+    except TouchBarBusy as exc:
+        sys.exit(f'dfrd: {exc}')
+    return None
+
+
+if __name__ == '__main__':
+    main()

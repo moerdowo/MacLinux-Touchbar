@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# touchbar-mode -- switch the Apple T1 Touch Bar between its two personalities.
+#
+#   keyboard   USB config 1 + apple-ibridge: firmware layouts, Esc, media keys.
+#              This is the safe default and what the machine boots into.
+#   display    USB config 2 + appletbdrm: the strip becomes /dev/dri/card2, a
+#              2170x60 framebuffer. NOTE there is no keyboard interface in this
+#              config -- until dfrd is running you have no Escape key.
+#   status     JSON, always exit 0, even on unsupported hardware.
+#
+# Nothing here is persistent: a power cycle always returns the device to
+# config 1, so a bad state is never more than a reboot away.
+
+set -u
+
+VID_PID=05ac8600
+DISPLAY_IF_SUFFIX=":2.3"        # config 2, interface 3 -- the class 0x10 AV one
+MODULES_KEYBOARD=(apple_ibridge apple_ib_tb apple_ib_als)
+
+find_usbdev() {
+  local d
+  for d in /sys/bus/usb/devices/*/; do
+    [ -f "$d/idVendor" ] || continue
+    if [ "$(cat "$d/idVendor")$(cat "$d/idProduct")" = "$VID_PID" ]; then
+      printf '%s' "${d%/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+need_root() {
+  [ "$(id -u)" = 0 ] || { echo "touchbar-mode: must run as root" >&2; exit 1; }
+}
+
+current_mode() {
+  local dev=$1 cfg
+  cfg=$(cat "$dev/bConfigurationValue" 2>/dev/null) || { echo unknown; return; }
+  case "$cfg" in
+    1) echo keyboard ;;
+    2) if [ -e /sys/bus/usb/drivers/appletbdrm/$(basename "$dev")$DISPLAY_IF_SUFFIX ]
+       then echo display; else echo "display-unbound"; fi ;;
+    *) echo "config-$cfg" ;;
+  esac
+}
+
+# The bulk IN endpoint can hold stale replies from a previous session, and
+# appletbdrm's probe reads a fixed 65 bytes and fails on anything else -- which
+# is why an undrained bind fails every other time. Drain before every bind.
+drain() {
+  python3 "$(dirname "$(readlink -f "$0")")/dfrdrain.py" >/dev/null 2>&1 || true
+}
+
+mode_display() {
+  need_root
+  local dev=$1 name
+  name=$(basename "$dev")
+
+  modprobe -r apple_ib_tb apple_ib_als apple_ibridge 2>/dev/null
+  sleep 1
+
+  modprobe appletbdrm || { echo "touchbar-mode: appletbdrm unavailable" >&2; exit 1; }
+  echo "05ac 8600 10" > /sys/bus/usb/drivers/appletbdrm/new_id 2>/dev/null
+
+  if [ "$(cat "$dev/bConfigurationValue")" != 2 ]; then
+    echo 2 > "$dev/bConfigurationValue" || {
+      echo "touchbar-mode: could not select USB config 2" >&2; exit 1; }
+    sleep 3
+  fi
+
+  local iface="$name$DISPLAY_IF_SUFFIX" try
+  for try in 1 2 3 4; do
+    [ -e "/sys/bus/usb/drivers/appletbdrm/$iface" ] && break
+    drain
+    echo "$iface" > /sys/bus/usb/drivers/appletbdrm/bind 2>/dev/null
+    sleep 1
+  done
+
+  if [ -e "/sys/bus/usb/drivers/appletbdrm/$iface" ]; then
+    echo "touchbar-mode: display mode ready ($(ls -d /sys/class/drm/card*/ 2>/dev/null | tail -1))"
+    echo "touchbar-mode: no Escape key until dfrd is running" >&2
+  else
+    echo "touchbar-mode: appletbdrm did not bind; reverting" >&2
+    mode_keyboard "$dev"
+    exit 1
+  fi
+}
+
+mode_keyboard() {
+  need_root
+  local dev=$1
+  echo 1 > "$dev/bConfigurationValue" 2>/dev/null
+  sleep 2
+  modprobe -r appletbdrm 2>/dev/null
+  local m
+  for m in "${MODULES_KEYBOARD[@]}"; do modprobe "$m" 2>/dev/null; done
+  sleep 2
+  echo "touchbar-mode: keyboard mode ($(current_mode "$dev"))"
+}
+
+status() {
+  local dev mode cfg card bound
+  if ! dev=$(find_usbdev); then
+    printf '{"supported":false,"mode":"absent"}\n'
+    return 0
+  fi
+  mode=$(current_mode "$dev")
+  cfg=$(cat "$dev/bConfigurationValue" 2>/dev/null || echo 0)
+  card=$(for c in /sys/class/drm/card*/device/driver; do
+           [ "$(basename "$(readlink -f "$c")" 2>/dev/null)" = appletbdrm ] &&
+             basename "$(dirname "$(dirname "$c")")"
+         done | head -1)
+  bound=$([ -n "$card" ] && echo true || echo false)
+  printf '{"supported":true,"mode":"%s","config":%s,"drm":"%s","bound":%s}\n' \
+    "$mode" "${cfg:-0}" "${card:-}" "$bound"
+}
+
+dev=$(find_usbdev) || { [ "${1:-status}" = status ] && status && exit 0
+                        echo "touchbar-mode: no iBridge (05ac:8600) found" >&2; exit 1; }
+
+case "${1:-status}" in
+  display)  mode_display "$dev" ;;
+  keyboard) mode_keyboard "$dev" ;;
+  toggle)   case "$(current_mode "$dev")" in
+              keyboard) mode_display "$dev" ;;
+              *)        mode_keyboard "$dev" ;;
+            esac ;;
+  status)   status ;;
+  *) echo "usage: touchbar-mode {keyboard|display|toggle|status}" >&2; exit 2 ;;
+esac

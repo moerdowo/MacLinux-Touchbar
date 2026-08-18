@@ -1,0 +1,1577 @@
+#!/usr/bin/env python3
+"""dfr-editor -- design your Touch Bar.
+
+The preview at the top of the window is not a mock-up. It calls the same
+dfrwidgets code the daemon draws the hardware with, against the same live
+feeds, so what you arrange here is exactly what appears on the strip. When the
+daemon is running, Live mode pushes each edit straight to it over the control
+socket -- change a colour and the panel under your fingers changes with it,
+before anything is saved.
+
+Layout, theme and settings are three views over one config document, with undo
+on every change and an explicit Save.
+"""
+
+import copy
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import gi
+
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gdk, GLib, Gtk, Pango   # noqa: E402
+
+import cairo                                           # noqa: E402
+
+import dfractions as A                                 # noqa: E402
+import dfrconfig as C                                  # noqa: E402
+import dfripc                                          # noqa: E402
+import dfrinput as di                                  # noqa: E402
+import dfrtheme as T                                   # noqa: E402
+import dfrwidgets as W                                 # noqa: E402
+from dfrfeeds import FeedHub                           # noqa: E402
+from dfrsession import Session                         # noqa: E402
+
+APP_ID = 'io.github.moerdowo.dfrd.editor'
+LANE_LABELS = {'left': 'Left', 'center': 'Centre', 'right': 'Right'}
+
+CSS = """
+.strip-frame {
+  background: linear-gradient(180deg, #2a2a2e, #131316);
+  border-radius: 14px;
+  padding: 10px;
+  box-shadow: inset 0 1px 0 alpha(#fff, 0.06), 0 2px 8px alpha(#000, 0.5);
+}
+.nerd { font-family: "JetBrainsMono Nerd Font"; font-size: 15pt; }
+.nerd-big { font-family: "JetBrainsMono Nerd Font"; font-size: 22pt; }
+.dim-label-small { font-size: 0.82em; opacity: 0.65; }
+.status-dot-on  { color: #3ddc97; }
+.status-dot-off { color: #ff5c6c; }
+.palette-row { min-height: 46px; }
+.zoom-scale { min-width: 140px; }
+"""
+
+
+def clone(value):
+    return copy.deepcopy(value)
+
+
+# --- document -----------------------------------------------------------
+
+class Document:
+    """The config plus undo history and change notification."""
+
+    def __init__(self, path=None):
+        self.path = path or C.config_path()
+        self.config, self.problems = C.load(self.path)
+        self._undo = []
+        self._redo = []
+        self.dirty = False
+        self._listeners = []
+
+    def connect(self, callback):
+        self._listeners.append(callback)
+
+    def _notify(self, structural=True):
+        for callback in self._listeners:
+            callback(structural)
+
+    def snapshot(self):
+        self._undo.append(json.dumps(self.config))
+        del self._undo[:-60]
+        self._redo.clear()
+
+    def changed(self, structural=True):
+        self.dirty = True
+        self._notify(structural)
+
+    def undo(self):
+        if not self._undo:
+            return False
+        self._redo.append(json.dumps(self.config))
+        self.config = json.loads(self._undo.pop())
+        self.dirty = True
+        self._notify(True)
+        return True
+
+    def redo(self):
+        if not self._redo:
+            return False
+        self._undo.append(json.dumps(self.config))
+        self.config = json.loads(self._redo.pop())
+        self.dirty = True
+        self._notify(True)
+        return True
+
+    def save(self):
+        C.save(self.config, self.path)
+        self.dirty = False
+        self._notify(False)
+        return self.path
+
+    # -- page/widget helpers -------------------------------------------
+
+    def pages(self):
+        return self.config.setdefault('pages', [])
+
+    def page(self, page_id):
+        for page in self.pages():
+            if page.get('id') == page_id:
+                return page
+        return self.pages()[0] if self.pages() else None
+
+    def find(self, widget_id):
+        return C.find_widget(self.config, widget_id)
+
+    def add_widget(self, page_id, lane, spec, index=None):
+        page = self.page(page_id)
+        spec = clone(spec)
+        spec['id'] = C.new_id(spec['type'][:3])
+        items = page.setdefault(lane, [])
+        items.insert(len(items) if index is None else index, spec)
+        return spec['id']
+
+    def remove_widget(self, widget_id):
+        page, lane, index, _ = self.find(widget_id)
+        if page is None:
+            return False
+        page[lane].pop(index)
+        return True
+
+    def move_widget(self, widget_id, lane, index):
+        page, old_lane, old_index, spec = self.find(widget_id)
+        if page is None:
+            return False
+        page[old_lane].pop(old_index)
+        if lane == old_lane and index > old_index:
+            index -= 1
+        target = page.setdefault(lane, [])
+        target.insert(max(0, min(index, len(target))), spec)
+        return True
+
+    def duplicate_widget(self, widget_id):
+        page, lane, index, spec = self.find(widget_id)
+        if page is None:
+            return None
+        copy_spec = clone(spec)
+        copy_spec['id'] = C.new_id(spec['type'][:3])
+        page[lane].insert(index + 1, copy_spec)
+        return copy_spec['id']
+
+
+# --- preview ------------------------------------------------------------
+
+class StripPreview(Gtk.DrawingArea):
+    """The strip, drawn with the daemon's own renderer, and draggable."""
+
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+        self.zoom = 0.0                 # 0 = fit to width
+        self.widgets = []
+        self.drag_id = None
+        self.drag_pos = None
+        self.drop_hint = None
+        self.set_content_height(int(W.STRIP_H * 0.9))
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+        click = Gtk.GestureClick()
+        click.connect('pressed', self._on_press)
+        self.add_controller(click)
+
+        drag = Gtk.GestureDrag()
+        drag.connect('drag-begin', self._on_drag_begin)
+        drag.connect('drag-update', self._on_drag_update)
+        drag.connect('drag-end', self._on_drag_end)
+        self.add_controller(drag)
+
+        motion = Gtk.EventControllerMotion()
+        motion.connect('motion', self._on_motion)
+        self.add_controller(motion)
+        self._hover = None
+
+    # -- geometry -------------------------------------------------------
+
+    def scale(self):
+        if self.zoom > 0:
+            return self.zoom
+        width = max(200, self.get_width())
+        return width / W.STRIP_W
+
+    def strip_point(self, x, y):
+        scale = self.scale()
+        return x / scale, y / scale
+
+    def update_height(self):
+        self.set_content_height(max(40, int(W.STRIP_H * self.scale())))
+        if self.zoom > 0:
+            self.set_size_request(int(W.STRIP_W * self.zoom), -1)
+        else:
+            self.set_size_request(-1, -1)
+
+    # -- drawing --------------------------------------------------------
+
+    def _draw(self, area, ctx, width, height, *_):
+        window = self.window
+        scale = self.scale()
+        ctx.save()
+        ctx.scale(scale, scale)
+        env = window.env(selected_id=window.selected_id)
+        page = window.current_page()
+        if page is None:
+            ctx.restore()
+            return
+        self.widgets = W.render_page(ctx, window.doc.config, page, env)
+
+        if self.drag_id and self.drop_hint:
+            lane, x_pos = self.drop_hint
+            T.set_source(ctx, T.parse_color('#4c8dff'))
+            ctx.rectangle(x_pos - 1.5, 2, 3, W.STRIP_H - 4)
+            ctx.fill()
+        ctx.restore()
+
+        # Lane guides while dragging, so "which group am I dropping into" is
+        # answerable without reading any documentation.
+        if self.drag_id:
+            for i in range(1, 3):
+                x_pos = width * i / 3
+                ctx.set_source_rgba(1, 1, 1, 0.14)
+                ctx.set_dash([4, 4])
+                ctx.set_line_width(1)
+                ctx.move_to(x_pos, 0)
+                ctx.line_to(x_pos, height)
+                ctx.stroke()
+            ctx.set_dash([])
+
+    # -- hit testing ----------------------------------------------------
+
+    def widget_at(self, x, y):
+        px, py = self.strip_point(x, y)
+        for widget in self.widgets:
+            if widget.contains(px, py) and widget.id != '__esc__':
+                return widget
+        return None
+
+    def lane_at(self, x):
+        third = max(1, self.get_width()) / 3
+        return 'left' if x < third else ('center' if x < third * 2 else 'right')
+
+    def insert_index(self, lane, x):
+        px, _ = self.strip_point(x, 0)
+        page = self.window.current_page() or {}
+        specs = page.get(lane, [])
+        index = 0
+        for spec in specs:
+            widget = next((w for w in self.widgets if w.id == spec.get('id')), None)
+            if widget is None or spec.get('id') == self.drag_id:
+                continue
+            if px > widget.x + widget.w / 2:
+                index += 1
+        return index
+
+    # -- input ----------------------------------------------------------
+
+    def _on_press(self, gesture, n_press, x, y):
+        widget = self.widget_at(x, y)
+        self.window.select(widget.id if widget else None)
+
+    def _on_motion(self, controller, x, y):
+        widget = self.widget_at(x, y)
+        new_hover = widget.id if widget else None
+        if new_hover != self._hover:
+            self._hover = new_hover
+            self.set_cursor(Gdk.Cursor.new_from_name(
+                'grab' if new_hover else 'default', None))
+
+    def _on_drag_begin(self, gesture, x, y):
+        widget = self.widget_at(x, y)
+        self.drag_id = widget.id if widget else None
+        self.drag_pos = (x, y)
+        if self.drag_id:
+            self.window.select(self.drag_id)
+            self.set_cursor(Gdk.Cursor.new_from_name('grabbing', None))
+
+    def _on_drag_update(self, gesture, dx, dy):
+        if not self.drag_id or not self.drag_pos:
+            return
+        x = self.drag_pos[0] + dx
+        lane = self.lane_at(x)
+        index = self.insert_index(lane, x)
+        page = self.window.current_page() or {}
+        specs = [s for s in page.get(lane, []) if s.get('id') != self.drag_id]
+        if index < len(specs):
+            target = next((w for w in self.widgets
+                           if w.id == specs[index].get('id')), None)
+            hint_x = target.x - 3 if target else 0
+        elif specs:
+            target = next((w for w in self.widgets
+                           if w.id == specs[-1].get('id')), None)
+            hint_x = (target.x + target.w + 3) if target else 0
+        else:
+            hint_x = {'left': 120, 'center': W.STRIP_W / 2,
+                      'right': W.STRIP_W - 120}[lane]
+        self.drop_hint = (lane, hint_x)
+        self.queue_draw()
+
+    def _on_drag_end(self, gesture, dx, dy):
+        if self.drag_id and self.drag_pos:
+            x = self.drag_pos[0] + dx
+            lane = self.lane_at(x)
+            index = self.insert_index(lane, x)
+            moved_id = self.drag_id
+            self.drag_id = None
+            self.drop_hint = None
+            self.window.doc.snapshot()
+            if self.window.doc.move_widget(moved_id, lane, index):
+                self.window.doc.changed()
+        self.drag_id = None
+        self.drop_hint = None
+        self.set_cursor(Gdk.Cursor.new_from_name('default', None))
+        self.queue_draw()
+
+
+# --- small reusable rows ------------------------------------------------
+
+class IconButton(Gtk.Button):
+    """Shows the chosen glyph and opens a picker."""
+
+    def __init__(self, value, on_pick):
+        super().__init__()
+        self.on_pick = on_pick
+        self.label = Gtk.Label(label=T.resolve_icon(value) or '—')
+        self.label.add_css_class('nerd')
+        self.set_child(self.label)
+        self.set_valign(Gtk.Align.CENTER)
+        self.set_tooltip_text('Choose an icon')
+        self.connect('clicked', self._open)
+
+    def set_value(self, value):
+        self.label.set_label(T.resolve_icon(value) or '—')
+
+    def _open(self, *_):
+        popover = Gtk.Popover()
+        popover.set_parent(self)
+        scroller = Gtk.ScrolledWindow(min_content_height=320,
+                                      min_content_width=380)
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                           max_children_per_line=8, homogeneous=True,
+                           row_spacing=4, column_spacing=4, margin_top=6,
+                           margin_bottom=6, margin_start=6, margin_end=6)
+        for name in sorted(T.ICONS):
+            button = Gtk.Button(has_frame=False, tooltip_text=name)
+            label = Gtk.Label(label=T.ICONS[name])
+            label.add_css_class('nerd')
+            button.set_child(label)
+            button.connect('clicked', self._choose, name, popover)
+            flow.append(button)
+        clear = Gtk.Button(label='No icon', margin_top=4)
+        clear.connect('clicked', self._choose, '', popover)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroller.set_child(flow)
+        box.append(scroller)
+        box.append(clear)
+        popover.set_child(box)
+        popover.popup()
+
+    def _choose(self, button, name, popover):
+        self.set_value(name)
+        self.on_pick(name)
+        popover.popdown()
+
+
+def color_button(hex_value, on_change):
+    rgba = Gdk.RGBA()
+    rgba.parse(hex_value if str(hex_value).startswith('#') else '#000000')
+    dialog = Gtk.ColorDialog(with_alpha=False)
+    button = Gtk.ColorDialogButton(dialog=dialog, rgba=rgba,
+                                   valign=Gtk.Align.CENTER)
+
+    def changed(btn, _param):
+        colour = btn.get_rgba()
+        on_change('#%02x%02x%02x' % (round(colour.red * 255),
+                                     round(colour.green * 255),
+                                     round(colour.blue * 255)))
+    button.connect('notify::rgba', changed)
+    return button
+
+
+# --- main window --------------------------------------------------------
+
+class EditorWindow(Adw.ApplicationWindow):
+    def __init__(self, app, doc):
+        super().__init__(application=app, title='Touch Bar')
+        self.doc = doc
+        self.doc.connect(self._on_doc_changed)
+        self.selected_id = None
+        self.page_id = doc.pages()[0]['id'] if doc.pages() else None
+        self.client = dfripc.Client()
+        self.live = False
+        self._push_source = None
+        self.session = Session(C.resolve_user())
+        self.hub = FeedHub(self.session)
+
+        self.set_default_size(1480, 880)
+        self._build()
+        self._refresh_all()
+        self.select_first()
+
+        GLib.timeout_add(250, self._tick)
+        GLib.timeout_add_seconds(3, self._poll_daemon)
+
+    # -- construction ---------------------------------------------------
+
+    def _build(self):
+        self.toasts = Adw.ToastOverlay()
+        root = Adw.ToolbarView()
+        self.toasts.set_child(root)
+        self.set_content(self.toasts)
+
+        header = Adw.HeaderBar()
+        root.add_top_bar(header)
+
+        self.page_dropdown = Gtk.DropDown.new_from_strings(['—'])
+        self.page_dropdown.set_tooltip_text('Page being edited')
+        self.page_dropdown.connect('notify::selected', self._on_page_selected)
+        header.pack_start(self.page_dropdown)
+
+        add_page = Gtk.Button(icon_name='list-add-symbolic',
+                              tooltip_text='New page')
+        add_page.connect('clicked', self._on_add_page)
+        header.pack_start(add_page)
+
+        page_menu = Gtk.MenuButton(icon_name='view-more-symbolic',
+                                   tooltip_text='Page options')
+        page_menu.set_popover(self._page_popover())
+        header.pack_start(page_menu)
+
+        self.view_switcher = Adw.ViewSwitcher(policy=Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(self.view_switcher)
+
+        self.save_button = Gtk.Button(label='Save')
+        self.save_button.add_css_class('suggested-action')
+        self.save_button.connect('clicked', lambda *_: self.save())
+        header.pack_end(self.save_button)
+
+        self.live_toggle = Gtk.ToggleButton(label='Live')
+        self.live_toggle.set_tooltip_text(
+            'Push every edit to the running daemon without saving')
+        self.live_toggle.connect('toggled', self._on_live_toggled)
+        header.pack_end(self.live_toggle)
+
+        menu_button = Gtk.MenuButton(icon_name='open-menu-symbolic')
+        menu = Gtk.PopoverMenu()
+        model = Gtk.Builder.new_from_string(MENU_XML, -1).get_object('app-menu')
+        menu.set_menu_model(model)
+        menu_button.set_popover(menu)
+        header.pack_end(menu_button)
+
+        self.status_icon = Gtk.Label(label='●')
+        self.status_icon.add_css_class('status-dot-off')
+        self.status_label = Gtk.Label(label='daemon offline')
+        self.status_label.add_css_class('dim-label-small')
+        status_box = Gtk.Box(spacing=6)
+        status_box.append(self.status_icon)
+        status_box.append(self.status_label)
+        header.pack_end(status_box)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.set_content(content)
+
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect('button-clicked', self._on_banner_action)
+        content.append(self.banner)
+
+        content.append(self._build_preview())
+
+        self.stack = Adw.ViewStack(vexpand=True)
+        self.view_switcher.set_stack(self.stack)
+        self.stack.add_titled_with_icon(self._build_layout_view(), 'layout',
+                                        'Layout', 'view-grid-symbolic')
+        self.stack.add_titled_with_icon(self._build_theme_view(), 'theme',
+                                        'Theme', 'applications-graphics-symbolic')
+        self.stack.add_titled_with_icon(self._build_settings_view(), 'settings',
+                                        'Settings', 'preferences-system-symbolic')
+        content.append(self.stack)
+
+        self._install_shortcuts()
+
+    def _build_preview(self):
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                        margin_top=12, margin_bottom=8, margin_start=14,
+                        margin_end=14)
+
+        holder = Gtk.Box()
+        holder.add_css_class('strip-frame')
+        self.preview_scroller = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vscrollbar_policy=Gtk.PolicyType.NEVER, hexpand=True)
+        self.preview = StripPreview(self)
+        self.preview_scroller.set_child(self.preview)
+        holder.append(self.preview_scroller)
+        frame.append(holder)
+
+        bar = Gtk.Box(spacing=8)
+        hint = Gtk.Label(label='Click to select · drag to rearrange · '
+                               'the three zones are left, centre and right')
+        hint.add_css_class('dim-label-small')
+        hint.set_hexpand(True)
+        hint.set_xalign(0.0)
+        bar.append(hint)
+
+        bar.append(Gtk.Label(label='Zoom', css_classes=['dim-label-small']))
+        self.zoom_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.35, 1.5, 0.05)
+        self.zoom_scale.set_value(0.6)
+        self.zoom_scale.set_draw_value(False)
+        self.zoom_scale.add_css_class('zoom-scale')
+        self.zoom_scale.connect('value-changed', self._on_zoom)
+        bar.append(self.zoom_scale)
+        fit = Gtk.Button(label='Fit')
+        fit.connect('clicked', self._on_fit)
+        bar.append(fit)
+        frame.append(bar)
+        return frame
+
+    def _build_layout_view(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL,
+                          position=430, shrink_start_child=False,
+                          shrink_end_child=False)
+        paned.set_start_child(self._build_palette())
+        self.property_scroller = Gtk.ScrolledWindow(hexpand=True)
+        self.property_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.property_scroller.set_child(self.property_box)
+        paned.set_end_child(self.property_scroller)
+        return paned
+
+    def _build_palette(self):
+        page = Adw.PreferencesPage()
+        by_category = {}
+        for type_, cls in W.WIDGET_TYPES.items():
+            if type_ == 'esc':
+                continue                        # reserved, not placeable
+            by_category.setdefault(cls.CATEGORY, []).append((type_, cls))
+        for category in W.PALETTE_ORDER + sorted(set(by_category) - set(W.PALETTE_ORDER)):
+            if category not in by_category:
+                continue
+            group = Adw.PreferencesGroup(title=category)
+            for type_, cls in sorted(by_category[category], key=lambda p: p[1].LABEL):
+                row = Adw.ActionRow(title=cls.LABEL, subtitle=cls.DESCRIPTION,
+                                    activatable=True)
+                row.add_css_class('palette-row')
+                glyph = Gtk.Label(label=T.resolve_icon(cls.ICON))
+                glyph.add_css_class('nerd')
+                row.add_prefix(glyph)
+                plus = Gtk.Image.new_from_icon_name('list-add-symbolic')
+                row.add_suffix(plus)
+                row.connect('activated', self._on_add_widget, type_)
+                group.add(row)
+            page.add(group)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_child(page)
+        return scroller
+
+    def _build_theme_view(self):
+        self.theme_page = Adw.PreferencesPage()
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_child(self.theme_page)
+        return scroller
+
+    def _build_settings_view(self):
+        self.settings_page = Adw.PreferencesPage()
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_child(self.settings_page)
+        return scroller
+
+    def _install_shortcuts(self):
+        controller = Gtk.EventControllerKey()
+
+        def on_key(_c, keyval, _code, state):
+            ctrl = state & Gdk.ModifierType.CONTROL_MASK
+            shift = state & Gdk.ModifierType.SHIFT_MASK
+            name = Gdk.keyval_name(keyval)
+            if ctrl and name in ('s', 'S'):
+                self.save()
+                return True
+            if ctrl and name in ('z', 'Z'):
+                (self.doc.redo if shift else self.doc.undo)()
+                return True
+            if ctrl and name in ('y', 'Y'):
+                self.doc.redo()
+                return True
+            if ctrl and name in ('d', 'D'):
+                self._duplicate_selected()
+                return True
+            if name in ('Delete', 'BackSpace') and self.selected_id:
+                self._delete_selected()
+                return True
+            return False
+
+        controller.connect('key-pressed', on_key)
+        self.add_controller(controller)
+
+    # -- state ----------------------------------------------------------
+
+    def theme(self):
+        return T.Theme(self.doc.config.get('theme'))
+
+    def env(self, **kw):
+        return W.Env(self.theme(), self.hub, self.doc.config, self.page_id,
+                     preview=True, **kw)
+
+    def current_page(self):
+        return self.doc.page(self.page_id)
+
+    def select_first(self):
+        """Land on something selected: an empty inspector teaches nothing."""
+        page = self.current_page() or {}
+        for lane in C.LANES:
+            if page.get(lane):
+                self.select(page[lane][0]['id'])
+                return
+        self.select(None)
+
+    def select(self, widget_id):
+        self.selected_id = widget_id
+        self._rebuild_properties()
+        self.preview.queue_draw()
+
+    # -- reactions ------------------------------------------------------
+
+    def _on_doc_changed(self, structural):
+        self._refresh_all()
+        if self.live:
+            self._schedule_push()
+
+    def _refresh_all(self):
+        pages = self.doc.pages()
+        names = [p.get('name', p.get('id', '?')) for p in pages] or ['—']
+        current = self.page_dropdown.get_selected()
+        self.page_dropdown.set_model(Gtk.StringList.new(names))
+        index = next((i for i, p in enumerate(pages) if p.get('id') == self.page_id), 0)
+        self.page_dropdown.set_selected(index if index < len(names) else 0)
+        if pages and (self.page_id is None or
+                      not any(p.get('id') == self.page_id for p in pages)):
+            self.page_id = pages[0]['id']
+        self.save_button.set_label('Save*' if self.doc.dirty else 'Save')
+        self._rebuild_properties()
+        self._rebuild_theme_page()
+        self._rebuild_settings_page()
+        self.preview.queue_draw()
+
+    def _tick(self):
+        self.hub.pump()
+        self.preview.queue_draw()
+        return True
+
+    def _poll_daemon(self):
+        status = self.client.status() if self.client.available() else \
+            {'ok': False, 'error': 'not running'}
+        online = bool(status.get('ok'))
+        self.status_icon.remove_css_class('status-dot-on' if not online
+                                          else 'status-dot-off')
+        self.status_icon.add_css_class('status-dot-on' if online
+                                       else 'status-dot-off')
+        if online:
+            self.status_label.set_label(
+                f"daemon on {status.get('page_name', '?')}"
+                + (' · preview' if status.get('preview') else ''))
+            self.banner.set_revealed(False)
+        else:
+            self.status_label.set_label('daemon offline')
+            self.banner.set_title(
+                'The Touch Bar daemon is not running — edits here are '
+                'previewed in this window only.')
+            self.banner.set_button_label('How to start it')
+            self.banner.set_revealed(True)
+        return True
+
+    def _on_banner_action(self, *_):
+        self._show_command_dialog(
+            'Start the Touch Bar',
+            'The daemon needs root to own the DRM node and /dev/uinput.\n'
+            'Run this in a terminal:',
+            'sudo systemctl start dfrd    # or: sudo ~/src/dfrd/dfrd')
+
+    def _show_command_dialog(self, title, body, command):
+        dialog = Adw.AlertDialog(heading=title, body=body)
+        entry = Gtk.Entry(text=command, editable=False, hexpand=True)
+        entry.add_css_class('monospace')
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.append(entry)
+        copy = Gtk.Button(label='Copy command')
+
+        def do_copy(*_):
+            self.get_clipboard().set(command)
+            self.toast('Command copied')
+        copy.connect('clicked', do_copy)
+        box.append(copy)
+        dialog.set_extra_child(box)
+        dialog.add_response('close', 'Close')
+        dialog.present(self)
+
+    def toast(self, message):
+        self.toasts.add_toast(Adw.Toast(title=message, timeout=3))
+
+    # -- live push ------------------------------------------------------
+
+    def _on_live_toggled(self, button):
+        self.live = button.get_active()
+        if self.live:
+            reply = self.client.ping()
+            if not reply.get('ok'):
+                self.toast('Daemon is not running — Live has nothing to talk to')
+                button.set_active(False)
+                return
+            self._push_live()
+        else:
+            self.client.clear_preview()
+            self.toast('Live preview off — the daemon is back on its saved config')
+
+    def _schedule_push(self):
+        if self._push_source:
+            GLib.source_remove(self._push_source)
+        self._push_source = GLib.timeout_add(180, self._push_live)
+
+    def _push_live(self):
+        self._push_source = None
+        if self.live:
+            reply = self.client.preview(self.doc.config, self.page_id)
+            if not reply.get('ok'):
+                self.toast(f"Live push failed: {reply.get('error')}")
+        return False
+
+    # -- page actions ---------------------------------------------------
+
+    def _on_page_selected(self, dropdown, _param):
+        pages = self.doc.pages()
+        index = dropdown.get_selected()
+        if 0 <= index < len(pages):
+            self.page_id = pages[index]['id']
+            self.select_first()
+            self.preview.queue_draw()
+            if self.live:
+                self._schedule_push()
+
+    def _page_popover(self):
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                      margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+
+        name_entry = Gtk.Entry(placeholder_text='Page name')
+        box.append(name_entry)
+
+        def rename(*_):
+            page = self.current_page()
+            text = name_entry.get_text().strip()
+            if page and text:
+                self.doc.snapshot()
+                page['name'] = text
+                self.doc.changed()
+                self.toast(f'Page renamed to {text}')
+                popover.popdown()
+        rename_btn = Gtk.Button(label='Rename page')
+        rename_btn.connect('clicked', rename)
+        box.append(rename_btn)
+
+        def refresh_entry(*_):
+            page = self.current_page()
+            name_entry.set_text(page.get('name', '') if page else '')
+        popover.connect('show', refresh_entry)
+
+        for label, direction in (('Move page left', -1), ('Move page right', +1)):
+            button = Gtk.Button(label=label)
+            button.connect('clicked', self._on_move_page, direction, popover)
+            box.append(button)
+
+        duplicate = Gtk.Button(label='Duplicate page')
+        duplicate.connect('clicked', self._on_duplicate_page, popover)
+        box.append(duplicate)
+
+        delete = Gtk.Button(label='Delete page')
+        delete.add_css_class('destructive-action')
+        delete.connect('clicked', self._on_delete_page, popover)
+        box.append(delete)
+
+        popover.set_child(box)
+        return popover
+
+    def _on_move_page(self, button, direction, popover):
+        pages = self.doc.pages()
+        index = next((i for i, p in enumerate(pages)
+                      if p.get('id') == self.page_id), None)
+        if index is None:
+            return
+        target = max(0, min(len(pages) - 1, index + direction))
+        if target == index:
+            return
+        self.doc.snapshot()
+        pages.insert(target, pages.pop(index))
+        self.doc.changed()
+        popover.popdown()
+
+    def _on_duplicate_page(self, button, popover):
+        page = self.current_page()
+        if page is None:
+            return
+        self.doc.snapshot()
+        copy_page = clone(page)
+        copy_page['id'] = C.new_id('page')
+        copy_page['name'] = f"{page.get('name', 'Page')} copy"
+        for lane in C.LANES:
+            for spec in copy_page.get(lane, []):
+                spec['id'] = C.new_id(spec['type'][:3])
+        self.doc.pages().append(copy_page)
+        self.page_id = copy_page['id']
+        self.doc.changed()
+        popover.popdown()
+        self.toast('Page duplicated')
+
+    def _on_delete_page(self, button, popover):
+        pages = self.doc.pages()
+        popover.popdown()
+        if len(pages) <= 1:
+            self.toast('The last page cannot be deleted')
+            return
+        page = self.current_page()
+        dialog = Adw.AlertDialog(
+            heading=f"Delete {page.get('name', 'this page')}?",
+            body='Its widgets go with it. Ctrl+Z brings them back.')
+        dialog.add_response('cancel', 'Cancel')
+        dialog.add_response('delete', 'Delete')
+        dialog.set_response_appearance('delete', Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def answered(_d, response):
+            if response != 'delete':
+                return
+            self.doc.snapshot()
+            pages.remove(page)
+            self.page_id = pages[0]['id']
+            self.selected_id = None
+            self.doc.changed()
+        dialog.connect('response', answered)
+        dialog.present(self)
+
+    def _on_add_page(self, *_):
+        self.doc.snapshot()
+        page = {'id': C.new_id('page'), 'name': f'Page {len(self.doc.pages()) + 1}',
+                'icon': 'pages', 'left': [], 'center': [], 'right': []}
+        self.doc.pages().append(page)
+        self.page_id = page['id']
+        self.doc.changed()
+        self.toast('Page added')
+
+    def _on_add_widget(self, row, type_):
+        page = self.current_page()
+        if page is None:
+            return
+        lane = 'center'
+        if self.selected_id:
+            _, selected_lane, _, _ = self.doc.find(self.selected_id)
+            lane = selected_lane or lane
+        self.doc.snapshot()
+        new_id = self.doc.add_widget(self.page_id, lane, W.defaults_for(type_))
+        self.selected_id = new_id
+        self.doc.changed()
+        self.toast(f'{W.WIDGET_TYPES[type_].LABEL} added to {LANE_LABELS[lane]}')
+
+    def _delete_selected(self):
+        if not self.selected_id:
+            return
+        self.doc.snapshot()
+        if self.doc.remove_widget(self.selected_id):
+            self.selected_id = None
+            self.doc.changed()
+            self.toast('Widget removed')
+
+    def _duplicate_selected(self):
+        if not self.selected_id:
+            return
+        self.doc.snapshot()
+        new_id = self.doc.duplicate_widget(self.selected_id)
+        if new_id:
+            self.selected_id = new_id
+            self.doc.changed()
+
+    def save(self):
+        path = self.doc.save()
+        self.toast(f'Saved to {path}')
+        reply = self.client.reload()
+        if reply.get('ok'):
+            self.live_toggle.set_active(False)
+        self._refresh_all()
+
+    def _on_zoom(self, scale):
+        self.preview.zoom = scale.get_value()
+        self.preview.update_height()
+        self.preview.queue_draw()
+
+    def _on_fit(self, *_):
+        self.preview.zoom = 0.0
+        self.preview.update_height()
+        self.preview.queue_draw()
+
+    # -- property panel --------------------------------------------------
+
+    def _rebuild_properties(self):
+        child = self.property_box.get_first_child()
+        while child:
+            self.property_box.remove(child)
+            child = self.property_box.get_first_child()
+
+        page = Adw.PreferencesPage()
+        self.property_box.append(page)
+
+        found = self.doc.find(self.selected_id) if self.selected_id else \
+            (None, None, None, None)
+        _, lane, index, spec = found
+        if spec is None:
+            group = Adw.PreferencesGroup(
+                title='Nothing selected',
+                description='Click a widget in the strip above, or add one '
+                            'from the palette on the left.')
+            page.add(group)
+            return
+
+        cls = W.WIDGET_TYPES.get(spec['type'], W.LabelWidget)
+        widget = W.build(spec)
+
+        general = Adw.PreferencesGroup(title=cls.LABEL,
+                                       description=cls.DESCRIPTION)
+        page.add(general)
+
+        lane_row = Adw.ComboRow(title='Group',
+                                subtitle='Which end of the strip it belongs to')
+        lane_row.set_model(Gtk.StringList.new(
+            [LANE_LABELS[lane_key] for lane_key in C.LANES]))
+        lane_row.set_selected(list(C.LANES).index(lane))
+        lane_row.connect('notify::selected', self._on_lane_changed, spec['id'])
+        general.add(lane_row)
+
+        order = Adw.ActionRow(title='Position',
+                              subtitle=f'{index + 1} of {len(self.current_page()[lane])}')
+        left_btn = Gtk.Button(icon_name='go-previous-symbolic',
+                              valign=Gtk.Align.CENTER)
+        right_btn = Gtk.Button(icon_name='go-next-symbolic',
+                               valign=Gtk.Align.CENTER)
+        left_btn.connect('clicked', self._on_nudge, spec['id'], -1)
+        right_btn.connect('clicked', self._on_nudge, spec['id'], +1)
+        order.add_suffix(left_btn)
+        order.add_suffix(right_btn)
+        general.add(order)
+
+        width_row = Adw.SpinRow.new_with_range(0, 1200, 2)
+        width_row.set_title('Width')
+        width_row.set_subtitle('0 sizes it to its content')
+        width_row.set_value(float(spec.get('width') or 0))
+        width_row.connect('notify::value', self._on_width_changed, spec['id'])
+        general.add(width_row)
+
+        flex_row = Adw.SpinRow.new_with_range(0, 12, 1)
+        flex_row.set_title('Stretch')
+        flex_row.set_subtitle('Share of the leftover space (0 = fixed width)')
+        flex_row.set_value(float(spec.get('flex') or 0))
+        flex_row.connect('notify::value', self._on_flex_changed, spec['id'])
+        general.add(flex_row)
+
+        # -- type-specific properties
+        if cls.SCHEMA:
+            props = Adw.PreferencesGroup(title='Properties')
+            page.add(props)
+            for field in cls.SCHEMA:
+                row = self._build_field_row(spec, field, widget)
+                if row is not None:
+                    props.add(row)
+
+        # -- actions
+        if spec['type'] not in ('spacer', 'label'):
+            page.add(self._build_action_group(spec, 'action', 'On tap'))
+            page.add(self._build_action_group(spec, 'long_action',
+                                              'On long press'))
+
+        danger = Adw.PreferencesGroup()
+        page.add(danger)
+        duplicate = Adw.ActionRow(title='Duplicate', activatable=True,
+                                  subtitle='Ctrl+D')
+        duplicate.connect('activated', lambda *_: self._duplicate_selected())
+        danger.add(duplicate)
+        delete = Adw.ActionRow(title='Remove widget', activatable=True,
+                               subtitle='Delete')
+        delete.add_css_class('error')
+        delete.connect('activated', lambda *_: self._delete_selected())
+        danger.add(delete)
+
+    def _build_field_row(self, spec, field, widget):
+        key, kind = field['key'], field['kind']
+        title = field['label']
+        value = spec.get('props', {}).get(key, field.get('default'))
+        help_text = field.get('help', '')
+
+        def commit(new_value):
+            self.doc.snapshot()
+            spec.setdefault('props', {})[key] = new_value
+            self.doc.changed(False)
+
+        if kind == 'bool':
+            row = Adw.SwitchRow(title=title, subtitle=help_text)
+            row.set_active(bool(value))
+            row.connect('notify::active',
+                        lambda r, _p: commit(r.get_active()))
+            return row
+
+        if kind == 'choice':
+            options = field.get('options', [])
+            row = Adw.ComboRow(title=title, subtitle=help_text)
+            row.set_model(Gtk.StringList.new([str(o) for o in options]))
+            if value in options:
+                row.set_selected(options.index(value))
+            row.connect('notify::selected',
+                        lambda r, _p: commit(options[r.get_selected()]))
+            return row
+
+        if kind in ('int', 'float'):
+            step = field.get('step', 1 if kind == 'int' else 0.05)
+            row = Adw.SpinRow.new_with_range(field.get('min', 0),
+                                             field.get('max', 1000), step)
+            row.set_title(title)
+            if help_text:
+                row.set_subtitle(help_text)
+            if kind == 'float':
+                row.set_digits(2)
+            row.set_value(float(value or 0))
+            row.connect('notify::value',
+                        lambda r, _p: commit(r.get_value() if kind == 'float'
+                                             else int(r.get_value())))
+            return row
+
+        if kind == 'icon':
+            row = Adw.EntryRow(title=title)
+            row.set_text(str(value or ''))
+            picker = IconButton(value, lambda name: (row.set_text(name),
+                                                     commit(name)))
+            row.add_suffix(picker)
+            row.connect('changed', lambda r: commit(r.get_text()))
+            return row
+
+        if kind == 'file':
+            row = Adw.EntryRow(title=title)
+            row.set_text(str(value or ''))
+            browse = Gtk.Button(icon_name='document-open-symbolic',
+                                valign=Gtk.Align.CENTER)
+
+            def choose(*_):
+                dialog = Gtk.FileDialog(title='Choose an image')
+
+                def done(dlg, result):
+                    try:
+                        chosen = dlg.open_finish(result)
+                    except GLib.Error:
+                        return
+                    if chosen:
+                        row.set_text(chosen.get_path())
+                dialog.open(self, None, done)
+            browse.connect('clicked', choose)
+            row.add_suffix(browse)
+            row.connect('changed', lambda r: commit(r.get_text()))
+            return row
+
+        if kind == 'page':
+            pages = self.doc.pages()
+            ids = [p['id'] for p in pages]
+            row = Adw.ComboRow(title=title, subtitle=help_text)
+            row.set_model(Gtk.StringList.new([p.get('name', p['id'])
+                                              for p in pages]))
+            if value in ids:
+                row.set_selected(ids.index(value))
+            row.connect('notify::selected',
+                        lambda r, _p: commit(ids[r.get_selected()]))
+            return row
+
+        row = Adw.EntryRow(title=title)
+        row.set_text('' if value is None else str(value))
+        row.connect('changed', lambda r: commit(r.get_text()))
+        return row
+
+    def _build_action_group(self, spec, key, title):
+        """One group: what kind of action, plus that kind's own fields.
+
+        The detail rows are rebuilt in place whenever the kind changes, so the
+        panel only ever shows fields that mean something for the current
+        choice -- no empty "URL" box under a key binding.
+        """
+        group = Adw.PreferencesGroup(title=title)
+        types = A.ACTION_TYPES
+        action = spec.get(key) or {'type': 'none'}
+
+        combo = Adw.ComboRow(title='Action')
+        combo.set_model(Gtk.StringList.new([A.ACTION_LABELS[t] for t in types]))
+        combo.set_selected(types.index(action['type'])
+                           if action.get('type') in types else 0)
+        group.add(combo)
+
+        detail_rows = []
+        building = {'first': True}
+
+        def commit(new_action):
+            spec[key] = new_action
+            # The first build just reflects what is already stored; marking the
+            # document dirty there would show unsaved changes the moment a
+            # widget is selected.
+            if not building['first']:
+                self.doc.changed(False)
+
+        def clear_rows():
+            while detail_rows:
+                group.remove(detail_rows.pop())
+
+        def add(row):
+            group.add(row)
+            detail_rows.append(row)
+
+        def rebuild(*_):
+            kind = types[combo.get_selected()]
+            current = spec.get(key) or {}
+            if current.get('type') != kind:
+                current = {'type': kind}
+                commit(current)
+            clear_rows()
+
+            if kind == 'key':
+                row = Adw.EntryRow(title='Keys')
+                row.set_text('+'.join(current.get('keys') or []))
+                picker = Gtk.MenuButton(icon_name='view-list-symbolic',
+                                        valign=Gtk.Align.CENTER,
+                                        tooltip_text='Key catalogue')
+                picker.set_popover(self._key_popover(row))
+                row.add_suffix(picker)
+
+                def on_keys(entry):
+                    keys = [k.strip().upper() for k in
+                            entry.get_text().replace(',', '+').split('+')
+                            if k.strip()]
+                    commit({'type': 'key', 'keys': keys})
+                    unknown = [k for k in keys if di.keycode(k) is None]
+                    entry.remove_css_class('error')
+                    if unknown:
+                        entry.add_css_class('error')
+                        entry.set_tooltip_text('Unknown: ' + ', '.join(unknown))
+                    else:
+                        entry.set_tooltip_text(None)
+                row.connect('changed', on_keys)
+                add(row)
+
+            elif kind == 'exec':
+                row = Adw.EntryRow(title='Command')
+                row.set_text(current.get('command', ''))
+                row.connect('changed', lambda r: commit(
+                    {'type': 'exec', 'command': r.get_text()}))
+                add(row)
+
+            elif kind == 'url':
+                row = Adw.EntryRow(title='URL')
+                row.set_text(current.get('url', ''))
+                row.connect('changed', lambda r: commit(
+                    {'type': 'url', 'url': r.get_text()}))
+                add(row)
+
+            elif kind == 'page':
+                pages = self.doc.pages()
+                targets = ['+1', '-1'] + [p['id'] for p in pages]
+                labels = ['Next page', 'Previous page'] + \
+                    [p.get('name', p['id']) for p in pages]
+                row = Adw.ComboRow(title='Go to')
+                row.set_model(Gtk.StringList.new(labels))
+                target = current.get('page', '+1')
+                row.set_selected(targets.index(target) if target in targets else 0)
+                row.connect('notify::selected', lambda r, _p: commit(
+                    {'type': 'page', 'page': targets[r.get_selected()]}))
+                add(row)
+
+            elif kind in ('volume', 'brightness'):
+                if kind == 'volume':
+                    mute = Adw.SwitchRow(title='Toggle mute instead of stepping')
+                    mute.set_active(bool(current.get('toggle_mute')))
+                    add(mute)
+                step = Adw.SpinRow.new_with_range(-50, 50, 5)
+                step.set_title('Change by')
+                step.set_subtitle('percentage points')
+                step.set_value(float(current.get('delta', 5)))
+                add(step)
+
+                def on_level(*_):
+                    if kind == 'volume' and mute.get_active():
+                        commit({'type': 'volume', 'toggle_mute': True})
+                    else:
+                        commit({'type': kind, 'delta': step.get_value()})
+                step.connect('notify::value', on_level)
+                if kind == 'volume':
+                    mute.connect('notify::active', on_level)
+
+            elif kind == 'hypr':
+                row = Adw.EntryRow(title='Dispatch')
+                row.set_text(current.get('dispatch', ''))
+                row.set_tooltip_text(
+                    'Lua form -- hyprctl rejects the legacy syntax here, so '
+                    'use hl.dsp.focus({ workspace = "3" })')
+                row.connect('changed', lambda r: commit(
+                    {'type': 'hypr', 'dispatch': r.get_text()}))
+                add(row)
+
+            elif kind == 'mode':
+                row = Adw.ActionRow(
+                    title='Returns the strip to keyboard mode',
+                    subtitle='Firmware keys come back and the daemon exits')
+                add(row)
+
+        combo.connect('notify::selected', rebuild)
+        rebuild()
+        building['first'] = False
+        return group
+
+    def _key_popover(self, entry_row):
+        popover = Gtk.Popover()
+        scroller = Gtk.ScrolledWindow(min_content_height=340,
+                                      min_content_width=300)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                      margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        for group_name, names in di.KEY_GROUPS:
+            label = Gtk.Label(label=group_name, xalign=0.0)
+            label.add_css_class('heading')
+            box.append(label)
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                               max_children_per_line=6, column_spacing=3,
+                               row_spacing=3)
+            for name in names:
+                button = Gtk.Button(label=name, has_frame=False)
+                button.add_css_class('dim-label-small')
+
+                def pick(_b, key=name):
+                    text = entry_row.get_text()
+                    entry_row.set_text(f'{text}+{key}' if text else key)
+                button.connect('clicked', pick)
+                flow.append(button)
+            box.append(flow)
+        scroller.set_child(box)
+        popover.set_child(scroller)
+        return popover
+
+    def _on_lane_changed(self, row, _param, widget_id):
+        lane = list(C.LANES)[row.get_selected()]
+        page, current_lane, _, _ = self.doc.find(widget_id)
+        if current_lane == lane:
+            return
+        self.doc.snapshot()
+        self.doc.move_widget(widget_id, lane, len(page.get(lane, [])))
+        self.doc.changed()
+
+    def _on_nudge(self, button, widget_id, direction):
+        page, lane, index, _ = self.doc.find(widget_id)
+        if page is None:
+            return
+        self.doc.snapshot()
+        self.doc.move_widget(widget_id, lane, index + direction +
+                             (1 if direction > 0 else 0))
+        self.doc.changed()
+
+    def _on_width_changed(self, row, _param, widget_id):
+        _, _, _, spec = self.doc.find(widget_id)
+        if spec is None:
+            return
+        value = int(row.get_value())
+        if value <= 0:
+            spec.pop('width', None)
+        else:
+            spec['width'] = value
+        self.doc.changed(False)
+
+    def _on_flex_changed(self, row, _param, widget_id):
+        _, _, _, spec = self.doc.find(widget_id)
+        if spec is None:
+            return
+        value = int(row.get_value())
+        if value <= 0:
+            spec.pop('flex', None)
+        else:
+            spec['flex'] = value
+        self.doc.changed(False)
+
+    # -- theme page ------------------------------------------------------
+
+    def _rebuild_theme_page(self):
+        page = self.theme_page
+        for group in list(getattr(self, '_theme_groups', [])):
+            page.remove(group)
+        self._theme_groups = []
+
+        theme_cfg = self.doc.config.setdefault('theme', {})
+        resolved = T.Theme(theme_cfg)
+
+        presets = Adw.PreferencesGroup(
+            title='Palette',
+            description='Start from a preset, then adjust any colour.')
+        names = sorted(T.PRESETS)
+        combo = Adw.ComboRow(title='Preset')
+        combo.set_model(Gtk.StringList.new([n.title() for n in names]))
+        current = theme_cfg.get('preset', 'midnight')
+        if current in names:
+            combo.set_selected(names.index(current))
+
+        def apply_preset(row, _param):
+            name = names[row.get_selected()]
+            self.doc.snapshot()
+            keep = {k: theme_cfg[k] for k in T.Theme.METRIC_KEYS + ('font', 'icon_font')
+                    if k in theme_cfg}
+            self.doc.config['theme'] = dict(T.PRESETS[name], preset=name, **keep)
+            self.doc.changed()
+        combo.connect('notify::selected', apply_preset)
+        presets.add(combo)
+        page.add(presets)
+        self._theme_groups.append(presets)
+
+        colours = Adw.PreferencesGroup(title='Colours')
+        descriptions = {
+            'background': 'The strip itself',
+            'surface': 'Button and widget fills',
+            'surface_alt': 'Secondary fills',
+            'pressed': 'While a key is held',
+            'text': 'Primary text',
+            'text_dim': 'Labels and secondary text',
+            'accent': 'Highlights, sliders, active page',
+            'good': 'Positive values',
+            'warn': 'Warnings',
+            'bad': 'Negative values and alerts',
+        }
+        for key in T.Theme.COLOR_KEYS:
+            row = Adw.ActionRow(title=key.replace('_', ' ').title(),
+                                subtitle=descriptions.get(key, ''))
+            hex_value = T.to_hex(getattr(resolved, key))
+
+            def on_change(new_hex, key=key):
+                self.doc.snapshot()
+                theme_cfg[key] = new_hex
+                theme_cfg['preset'] = 'custom'
+                self.doc.changed(False)
+            row.add_suffix(color_button(hex_value, on_change))
+            colours.add(row)
+        page.add(colours)
+        self._theme_groups.append(colours)
+
+        metrics = Adw.PreferencesGroup(title='Shape and type')
+        specs = [
+            ('radius', 'Corner radius', 0, 30, 1),
+            ('gap', 'Gap between widgets', 0, 30, 1),
+            ('padding', 'Edge padding', 0, 20, 1),
+            ('label_size', 'Label size', 8, 34, 1),
+            ('value_size', 'Value size', 8, 34, 1),
+            ('icon_size', 'Icon size', 8, 40, 1),
+        ]
+        for key, title, low, high, step in specs:
+            row = Adw.SpinRow.new_with_range(low, high, step)
+            row.set_title(title)
+            row.set_value(float(getattr(resolved, key)))
+
+            def on_metric(row_widget, _param, key=key):
+                self.doc.snapshot()
+                theme_cfg[key] = row_widget.get_value()
+                self.doc.changed(False)
+            row.connect('notify::value', on_metric)
+            metrics.add(row)
+
+        for key, title in (('font', 'Text font'), ('icon_font', 'Icon font')):
+            row = Adw.EntryRow(title=title)
+            row.set_text(getattr(resolved, key))
+
+            def on_font(entry, key=key):
+                theme_cfg[key] = entry.get_text()
+                self.doc.changed(False)
+            row.connect('changed', on_font)
+            metrics.add(row)
+        page.add(metrics)
+        self._theme_groups.append(metrics)
+
+    # -- settings page ---------------------------------------------------
+
+    def _rebuild_settings_page(self):
+        page = self.settings_page
+        for group in list(getattr(self, '_settings_groups', [])):
+            page.remove(group)
+        self._settings_groups = []
+        settings = self.doc.config.setdefault('settings', {})
+
+        def commit(key, value):
+            self.doc.snapshot()
+            settings[key] = value
+            self.doc.changed(False)
+
+        safety = Adw.PreferencesGroup(
+            title='Safety',
+            description='USB config 2 has no keyboard interface, so this '
+                        'daemon is the only source of an Escape key while the '
+                        'strip is in display mode.')
+        esc = Adw.SwitchRow(title='Always reserve an Escape key',
+                            subtitle='Drawn by the daemon on every page')
+        esc.set_active(bool(settings.get('always_esc', True)))
+        esc.connect('notify::active', lambda r, _p: commit('always_esc',
+                                                           r.get_active()))
+        safety.add(esc)
+
+        esc_width = Adw.SpinRow.new_with_range(60, 200, 2)
+        esc_width.set_title('Escape key width')
+        esc_width.set_value(float(settings.get('esc_width', 92)))
+        esc_width.connect('notify::value',
+                          lambda r, _p: commit('esc_width', int(r.get_value())))
+        safety.add(esc_width)
+
+        revert = Adw.SwitchRow(
+            title='Return to keyboard mode when the daemon stops',
+            subtitle='Restores the firmware keys instead of leaving the strip dark')
+        revert.set_active(bool(settings.get('revert_on_exit', True)))
+        revert.connect('notify::active',
+                       lambda r, _p: commit('revert_on_exit', r.get_active()))
+        safety.add(revert)
+        page.add(safety)
+        self._settings_groups.append(safety)
+
+        behaviour = Adw.PreferencesGroup(title='Behaviour')
+        swipe = Adw.SwitchRow(title='Swipe to change page',
+                              subtitle='Drag across the strip')
+        swipe.set_active(bool(settings.get('swipe_pages', True)))
+        swipe.connect('notify::active',
+                      lambda r, _p: commit('swipe_pages', r.get_active()))
+        behaviour.add(swipe)
+
+        dim = Adw.SpinRow.new_with_range(0, 600, 10)
+        dim.set_title('Blank after')
+        dim.set_subtitle('Seconds of no touch. 0 keeps it lit.')
+        dim.set_value(float(settings.get('dim_after', 0)))
+        dim.connect('notify::value',
+                    lambda r, _p: commit('dim_after', int(r.get_value())))
+        behaviour.add(dim)
+        page.add(behaviour)
+        self._settings_groups.append(behaviour)
+
+        calibration = Adw.PreferencesGroup(
+            title='Touch calibration',
+            description='Only needed if taps land on the wrong widget.')
+        for key, title in (('flip_x', 'Flip horizontally'),
+                           ('flip_y', 'Flip vertically')):
+            row = Adw.SwitchRow(title=title)
+            row.set_active(bool(settings.get(key)))
+            row.connect('notify::active',
+                        lambda r, _p, key=key: commit(key, r.get_active()))
+            calibration.add(row)
+        page.add(calibration)
+        self._settings_groups.append(calibration)
+
+        hardware = Adw.PreferencesGroup(
+            title='Hardware',
+            description='The strip must be in display mode for any of this to '
+                        'reach the panel.')
+        for label, subtitle, command in (
+            ('Switch to display mode',
+             'Hands the strip to dfrd. No Escape key until the daemon draws one.',
+             'sudo dfrctl mode display'),
+            ('Switch to keyboard mode',
+             'Gives the firmware keys back.',
+             'sudo dfrctl mode keyboard'),
+        ):
+            row = Adw.ActionRow(title=label, subtitle=subtitle, activatable=True)
+            row.connect('activated', lambda _r, cmd=command, t=label:
+                        self._show_command_dialog(t, 'Run this in a terminal:', cmd))
+            hardware.add(row)
+        page.add(hardware)
+        self._settings_groups.append(hardware)
+
+
+MENU_XML = """
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <menu id="app-menu">
+    <section>
+      <item><attribute name="label">Undo</attribute>
+            <attribute name="action">win.undo</attribute></item>
+      <item><attribute name="label">Redo</attribute>
+            <attribute name="action">win.redo</attribute></item>
+    </section>
+    <section>
+      <item><attribute name="label">Reload daemon config</attribute>
+            <attribute name="action">win.reload</attribute></item>
+      <item><attribute name="label">Reset to defaults</attribute>
+            <attribute name="action">win.reset</attribute></item>
+    </section>
+  </menu>
+</interface>
+"""
+
+
+class EditorApp(Adw.Application):
+    def __init__(self, options=None):
+        super().__init__(application_id=APP_ID)
+        self.options = options
+        self.window = None
+
+    def do_activate(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        if self.window is None:
+            doc = Document(getattr(self.options, 'config', None))
+            self.window = EditorWindow(self, doc)
+            self._install_actions(self.window, doc)
+            view = getattr(self.options, 'view', 'layout')
+            if view != 'layout':
+                self.window.stack.set_visible_child_name(view)
+        self.window.present()
+
+    def _install_actions(self, window, doc):
+        from gi.repository import Gio
+
+        def add(name, callback):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', callback)
+            window.add_action(action)
+
+        add('undo', lambda *_: doc.undo())
+        add('redo', lambda *_: doc.redo())
+        add('reload', lambda *_: window.toast(
+            str(window.client.reload().get('error', 'daemon reloaded'))))
+
+        def reset(*_):
+            dialog = Adw.AlertDialog(
+                heading='Reset to defaults?',
+                body='Your pages, theme and settings will be replaced by the '
+                     'stock layout. This can be undone with Ctrl+Z.')
+            dialog.add_response('cancel', 'Cancel')
+            dialog.add_response('reset', 'Reset')
+            dialog.set_response_appearance('reset', Adw.ResponseAppearance.DESTRUCTIVE)
+
+            def answered(_d, response):
+                if response == 'reset':
+                    doc.snapshot()
+                    doc.config = C.default_config()
+                    doc.changed()
+            dialog.connect('response', answered)
+            dialog.present(window)
+        add('reset', reset)
+
+
+def parse_args(argv):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='dfr-editor', description='Design your Touch Bar')
+    parser.add_argument('--config', help='config file to edit')
+    parser.add_argument('--view', choices=['layout', 'theme', 'settings'],
+                        default='layout', help='which view to open on')
+    return parser.parse_known_args(argv[1:])[0]
+
+
+if __name__ == '__main__':
+    OPTIONS = parse_args(sys.argv)
+    sys.exit(EditorApp(OPTIONS).run([sys.argv[0]]))

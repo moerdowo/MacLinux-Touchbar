@@ -1,0 +1,30 @@
+[Unit]
+Description=Apple T1 Touch Bar daemon
+Documentation=file:/usr/local/lib/dfrd/README.md
+# The daemon needs the user's session to launch apps, read MPRIS and talk to
+# Hyprland, so it is pointless before one exists.
+After=graphical.target systemd-user-sessions.service
+ConditionPathExists=/sys/bus/usb/drivers/appletbdrm
+
+[Service]
+Type=simple
+# Put the strip into display mode first, and always hand it back afterwards.
+# Config 2 has no keyboard interface, so a stopped daemon that left the strip
+# in display mode would be a laptop with no Escape key.
+ExecStartPre=/usr/local/lib/dfrd/touchbar-mode display
+ExecStart=/usr/local/lib/dfrd/dfrd --no-revert
+ExecStopPost=/usr/local/lib/dfrd/touchbar-mode keyboard
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+# It needs root for the DRM node, uinput and the USB config switch, but it
+# should not be able to reach much else.
+NoNewPrivileges=no
+ProtectHome=no
+ProtectSystem=strict
+ReadWritePaths=/run /sys/bus/usb /dev
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical.target

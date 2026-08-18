@@ -1,0 +1,9 @@
+# The Apple T1 Touch Bar registers as a DRM device (appletbdrm) when the iBridge
+# is switched to USB config 2.  Left on seat0, systemd-logind opens it for the
+# graphical session and takes DRM master, and Hyprland lists it as a permanently
+# disabled 60x2170 monitor -- AQ_DRM_DEVICES does not help, because aquamarine
+# only consults it during the initial scanGPUs(), not on hotplug.
+#
+# Untagging the node keeps logind out of it, so dfrd can take DRM master itself.
+# Scoped to the iBridge's USB parent and to card*, so the PCI GPUs are untouched.
+SUBSYSTEM=="drm", KERNEL=="card*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="8600", TAG-="seat", TAG-="master-of-seat", ENV{ID_SEAT}=""
