@@ -1155,6 +1155,190 @@ class ScriptWidget(Widget):
                         weight='semibold', align=T.ALIGN_LEFT)
 
 
+class KittWidget(Widget):
+    """Spectrum of the machine's own output, as a red LED matrix.
+
+    Named for what it looks like rather than what it measures: the Knight
+    Rider scanner is a row of red cells, and that is the whole visual idea --
+    discrete lit pixels with dark ones still visible between them, not a smooth
+    bar. Drawing the unlit cells is the point; a gradient with no grid reads as
+    a progress bar, and the grid is what makes it read as hardware.
+
+    Mirrored from the centre by default, with bass in the middle. That puts the
+    kick drum where the eye already is on a strip 2170px wide and 60 tall, and
+    it makes the display symmetric about the point the user looks at rather
+    than sweeping their attention to one end.
+    """
+    TYPE, LABEL, ICON = 'kitt', 'KITT visualiser', 'music'
+    CATEGORY = 'Live data'
+    DESCRIPTION = 'Audio spectrum of this machine\'s output, as a red LED matrix.'
+    DEFAULT_WIDTH = 640
+    HAS_SURFACE = False
+
+    SCHEMA = [
+        field('bands', 'Bands', 'int', 48, min=4, max=64,
+              help='Mirrored, so the strip shows twice this many columns'),
+        field('rows', 'Rows', 'int', 9, min=3, max=11),
+        field('mirror', 'Mirror from centre', 'bool', True),
+        field('grow', 'Grow', 'choice', 'center', options=['center', 'up'],
+              help='Cells light outward from the middle row, or up from the floor'),
+        field('color', 'Colour', 'color', '#ff1e0a'),
+        field('peaks', 'Peak hold', 'bool', True),
+        field('idle_scan', 'Sweep when silent', 'bool', True,
+              help='The Knight Rider scan, when nothing is playing'),
+        field('auto_gain', 'Auto gain', 'bool', True,
+              help='Ride the level so quiet system volume still fills the strip'),
+        field('gain', 'Gain dB', 'int', 0, min=-12, max=24,
+              help='Trim on top of auto gain'),
+        field('fps', 'Frames per second', 'int', 30, min=10, max=60,
+              help='Every frame is a USB transfer; 30 is smooth and cheap'),
+    ]
+
+    def feeds(self):
+        return [('audio', {'bands': int(self.num('bands', 48)),
+                           'gain': int(self.num('gain', 0)),
+                           'auto_gain': bool(self.flag('auto_gain', True))})]
+
+    def tick_interval(self):
+        # Animation, not data: the sweep has to move while the feed is silent
+        # and unchanging, so this widget asks to be repainted on a clock.
+        return 1.0 / max(10.0, min(60.0, self.num('fps', 30)))
+
+    # -- colour ---------------------------------------------------------
+
+    def _ramp(self, base, heat, lit, peak=False):
+        """Cell colour. `heat` is 0..1 for how hard the diode is driven, `lit`
+        its brightness; `peak` is the hold marker sitting above the bar.
+
+        One hue throughout. An LED bar is a single colour of diode driven
+        harder, so heat lifts it only slightly off red -- enough that a loud
+        band looks hotter than a quiet one, nowhere near enough to reach
+        orange. The first version of this ramp added 0.62 to green at the top
+        of the column and the whole strip came out looking like fire, which is
+        a different object with a different meaning.
+        """
+        if lit <= 0.001:
+            # The unlit diode. Visible, but only just: this is what makes the
+            # matrix read as a grid of pixels rather than as empty background.
+            return (base[0] * 0.22, base[1] * 0.22, base[2] * 0.22, 0.5)
+        if peak:
+            # The only thing allowed to look hotter than the bar it caps.
+            return (min(1.0, base[0] + 0.10), min(1.0, base[1] + 0.42),
+                    min(1.0, base[2] + 0.34), 1.0)
+        warm = min(1.0, max(0.0, heat))
+        r = min(1.0, base[0] + warm * 0.05)
+        g = min(1.0, base[1] + warm * 0.24)
+        b = min(1.0, base[2] + warm * 0.10)
+        scale = 0.40 + 0.60 * lit
+        return (r * scale, g * scale, b * scale, 1.0)
+
+    # -- geometry -------------------------------------------------------
+
+    def _columns(self, values):
+        if not self.flag('mirror', True):
+            return list(values)
+        # Reversed on the left, forward on the right: band 0 lands either side
+        # of the centre line, so bass pulses out from the middle.
+        return list(reversed(values)) + list(values)
+
+    def draw_content(self, ctx, env):
+        data = env.feed(*self.feeds()[0][:1], **self.feeds()[0][1])
+        x, y, w, h = self.inner()
+        base = T.parse_color(self.prop('color', '#ff1e0a'), (1.0, 0.12, 0.04, 1.0))
+        rows = max(3, min(11, int(self.num('rows', 9))))
+
+        bands = data.get('bands') or []
+        peaks = data.get('peaks') or []
+        if not bands:
+            # No capture yet, or PipeWire refused. Draw the dark matrix anyway:
+            # an empty rectangle looks like a crashed widget, while an unlit
+            # grid looks like a display waiting for signal, which it is.
+            bands = [0.0] * int(self.num('bands', 48))
+            peaks = []
+
+        silent = bool(data.get('silent')) or not data.get('_ok', True)
+        columns = self._columns(bands)
+        peak_columns = self._columns(peaks) if peaks and self.flag('peaks', True) else []
+
+        count = len(columns)
+        if count < 1 or w <= 0:
+            return
+        cell_w = w / count
+        gap_x = min(8.0, cell_w * 0.28)
+        cell_h = h / rows
+        gap_y = min(3.0, cell_h * 0.22)
+
+        centre_grow = self.prop('grow', 'center') == 'center'
+        # In centre-growth a column has (rows+1)//2 distinct steps, because the
+        # rows pair up either side of the middle one.
+        levels = (rows + 1) // 2 if centre_grow else rows
+        middle = (rows - 1) / 2.0
+
+        scan = None
+        if silent and self.flag('idle_scan', True):
+            scan = self._scan_position(env, count)
+
+        for ci in range(count):
+            value = columns[ci] if scan is None else 0.0
+            peak = peak_columns[ci] if (peak_columns and scan is None) else None
+            cx = x + ci * cell_w
+            for ri in range(rows):
+                distance = abs(ri - middle)
+                # 0 at the middle row, or 0 at the floor.
+                step = int(distance + 0.5) if centre_grow else rows - 1 - ri
+                level = step / max(1, levels - 1) if levels > 1 else 0.0
+
+                is_peak = False
+                if scan is not None:
+                    lit = self._scan_brightness(
+                        scan, ci, count, distance if centre_grow else step, levels)
+                    # The sweep has no column height to take heat from, so the
+                    # head itself is what runs hot.
+                    heat = lit
+                else:
+                    reach = value * levels
+                    if step + 1 <= reach:
+                        lit = 1.0
+                    elif step <= reach:
+                        lit = reach - step               # the moving top cell
+                    else:
+                        lit = 0.0
+                    # Heat comes from both how high the cell sits and how loud
+                    # the band is, so a tall bar glows harder than a short one
+                    # reaching the same row.
+                    heat = level * (0.45 + 0.55 * value)
+                    if peak is not None and lit < 1.0 and peak > 0.02:
+                        if abs(step - int(peak * levels)) < 0.5:
+                            lit, is_peak = 1.0, True
+
+                colour = self._ramp(base, heat, lit, peak=is_peak)
+                T.set_source(ctx, colour)
+                ctx.rectangle(cx + gap_x / 2, y + ri * cell_h + gap_y / 2,
+                              max(1.0, cell_w - gap_x), max(1.0, cell_h - gap_y))
+                ctx.fill()
+
+    # -- the idle sweep -------------------------------------------------
+
+    def _scan_position(self, env, count):
+        """Where the Knight Rider head is, 0..count-1, sweeping and easing."""
+        period = 2.4
+        phase = (env.now % period) / period
+        # Triangle, then a cosine ease so the head slows at the turns rather
+        # than reversing at full speed, which is what the prop actually did.
+        tri = 1.0 - abs(2.0 * phase - 1.0)
+        eased = 0.5 - 0.5 * math.cos(tri * math.pi)
+        return eased * (count - 1)
+
+    @staticmethod
+    def _scan_brightness(head, ci, count, distance, levels):
+        """Gaussian falloff from the head, narrowed toward the outer rows."""
+        spread = max(2.0, count * 0.055)
+        horizontal = math.exp(-((ci - head) ** 2) / (2.0 * spread * spread))
+        vertical = 1.0 - (distance / max(1, levels)) * 0.55
+        value = horizontal * vertical
+        return value if value > 0.02 else 0.0
+
+
 class PagerWidget(Widget):
     TYPE, LABEL, ICON = 'pager', 'Page switcher', 'pages'
     CATEGORY = 'Navigation'
@@ -1225,7 +1409,7 @@ for cls in (ButtonWidget, LabelWidget, ImageWidget, SpacerWidget, ClockWidget,
             CryptoWidget, StockWidget, WeatherWidget, ScriptWidget,
             CpuWidget, MemoryWidget, TemperatureWidget, DiskWidget,
             NetworkWidget, BatteryWidget, VolumeWidget, BrightnessWidget,
-            MediaWidget, WorkspacesWidget, PagerWidget, EscWidget):
+            MediaWidget, WorkspacesWidget, KittWidget, PagerWidget, EscWidget):
     WIDGET_TYPES[cls.TYPE] = cls
 
 #: Order used by the editor's "add widget" palette.

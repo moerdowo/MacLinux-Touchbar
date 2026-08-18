@@ -149,6 +149,14 @@ def default_config():
                 ],
             },
             {
+                # Nothing but the visualiser: it is the one page whose point is
+                # the whole strip, and a clock beside it would only be
+                # something else for the eye to land on.
+                'id': 'kitt', 'name': 'KITT', 'icon': 'music',
+                'left': [], 'center': [widget('kitt', flex=1)],
+                'right': [widget('pager', mode='next', icon='pages')],
+            },
+            {
                 'id': 'system', 'name': 'System', 'icon': 'gauge',
                 'left': [
                     widget('cpu', width=210, style='graph'),

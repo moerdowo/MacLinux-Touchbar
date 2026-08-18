@@ -53,7 +53,8 @@ TOUCHBAR_MODE = os.path.join(HERE, 'touchbar-mode')
 
 LONG_PRESS = 0.55            # seconds before a press counts as a long press
 SWIPE_MIN = 260              # px of travel that counts as a page swipe
-TICK = 0.05                  # render loop period
+TICK = 0.05                  # render loop period, when nothing wants faster
+FAST_TICK = 1.0 / 60         # floor, so an animated widget cannot spin the loop
 
 
 def log(message, *, err=False):
@@ -409,6 +410,22 @@ class Daemon:
 
     # -- loop -----------------------------------------------------------
 
+    def frame_period(self):
+        """How long the loop may sleep, given what is on screen.
+
+        Idle pages are woken by their feeds and 20Hz is plenty; a visualiser
+        wants 30 or more and says so through `tick_interval`. Taking the
+        minimum means the fast path costs nothing on pages that do not have
+        one -- the alternative, raising TICK globally, would make every page
+        redraw and re-flush over USB three times as often for no benefit.
+        """
+        period = TICK
+        for widget in self.widgets:
+            wanted = widget.tick_interval()
+            if wanted is not None:
+                period = min(period, max(FAST_TICK, float(wanted)))
+        return period
+
     def run(self):
         self.open_hardware()
         self.relayout()
@@ -427,7 +444,7 @@ class Daemon:
         last_config_check = 0.0
         try:
             while self.running:
-                poller.poll(int(TICK * 1000))
+                poller.poll(max(1, int(self.frame_period() * 1000)))
                 now = time.monotonic()
 
                 if self.digitizer:

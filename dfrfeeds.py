@@ -11,9 +11,12 @@ for them in a while, so switching to a page without a crypto widget stops the
 crypto polling on its own.
 """
 
+import cmath
 import json
+import math
 import os
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -72,6 +75,15 @@ class Feed:
 
     def fetch(self):
         raise NotImplementedError
+
+    def close(self):
+        """Release anything this feed owns. Called on retirement and shutdown.
+
+        Almost every feed here is a function of /proc or an HTTP call and has
+        nothing to release, so the default is a no-op -- but the audio feed
+        holds a live capture process, and a retired feed that kept PipeWire
+        recording would be a leak nobody would ever notice.
+        """
 
     def _run(self):
         try:
@@ -367,6 +379,362 @@ class ScriptFeed(Feed):
                 'json': payload, 'stderr': (err or '').strip()}
 
 
+# --- audio --------------------------------------------------------------
+
+#: Capture format. 22050 Hz mono reaches 11 kHz, which is the whole of the
+#: useful display range, at a quarter of the samples 44.1 kHz stereo would
+#: cost -- and this runs on a 2016 laptop with a fragile GPU beside it.
+AUDIO_RATE = 22050
+AUDIO_FFT = 1024                 # 46ms window, 21.5 Hz per bin
+AUDIO_ANALYSIS_HZ = 60.0         # analysis cadence, independent of the render loop
+AUDIO_SILENCE = 1.2e-3           # absolute floor under which it is always silence
+AUDIO_SILENCE_HOLD = 0.75        # seconds under the threshold before we believe it
+AUDIO_FLOOR_WINDOW = 20.0        # seconds the noise floor is measured over
+AUDIO_FLOOR_MARGIN = 3.2         # how far above the floor still counts as silence
+AUDIO_FLOOR_MAX = 6e-3           # a "floor" louder than this (~-44 dBFS) is music
+AUDIO_WARMUP = 0.25              # seconds of capture discarded at stream start
+AUDIO_TARGET_DB = -16.0          # where auto-gain tries to put the loudest band
+AUDIO_AGC_RANGE = (-8.0, 36.0)   # how far auto-gain may push, in dB
+
+
+def _fft_tables(n):
+    """Bit-reversal permutation and twiddle factors for a radix-2 FFT."""
+    levels = n.bit_length() - 1
+    rev = [0] * n
+    for i in range(n):
+        r, x = 0, i
+        for _ in range(levels):
+            r = (r << 1) | (x & 1)
+            x >>= 1
+        rev[i] = r
+    return rev, [cmath.exp(-2j * math.pi * k / n) for k in range(n // 2)]
+
+
+def _fft(samples, rev, twiddles):
+    """In-place iterative radix-2 FFT.
+
+    Pure Python on purpose: numpy is not installed here and this is the only
+    thing in dfrd that would want it, so a 1024-point transform measured at
+    1.7ms -- about 5% of one core at 30fps -- is a much smaller price than a
+    dependency the daemon would then need at boot.
+    """
+    n = len(samples)
+    out = [samples[rev[i]] for i in range(n)]
+    size = 2
+    while size <= n:
+        half, step = size >> 1, n // size
+        for i in range(0, n, size):
+            k = 0
+            for j in range(i, i + half):
+                t = twiddles[k] * out[j + half]
+                u = out[j]
+                out[j] = u + t
+                out[j + half] = u - t
+                k += step
+        size <<= 1
+    return out
+
+
+class AudioFeed(Feed):
+    """Spectrum of what this machine is actually playing.
+
+    Not a poller like every other feed here. PipeWire is asked once for a
+    continuous monitor stream and a reader thread owns it for the feed's whole
+    life; `fetch` only hands back the newest analysis. The Feed machinery still
+    drives retirement and error reporting, which is why this is a Feed at all
+    rather than something bolted to the daemon -- leave the visualiser page and
+    the capture stops on its own, exactly like the crypto poller does.
+
+    The source is the *monitor* of the default sink, so it hears the mix
+    leaving the machine: every application, post-volume, and nothing from the
+    microphone. Following the default sink rather than a fixed device name
+    means switching output to headphones does not silently freeze the display.
+    """
+    kind, interval = 'audio', 0.0    # analysed on its own thread; never polled
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.bands = max(4, min(64, int(self.params.get('bands') or 24)))
+        self.gain_db = float(self.params.get('gain') or 0.0)
+        self.auto_gain = self.params.get('auto_gain', True) not in (
+            False, 0, '0', 'false', 'no', 'off')
+        self._lock = threading.Lock()
+        self._proc = None
+        self._thread = None
+        self._stopping = threading.Event()
+        self._snapshot = {}
+        self._fail = None
+        self._rev, self._tw = _fft_tables(AUDIO_FFT)
+        self._window = [0.5 - 0.5 * math.cos(2 * math.pi * i / (AUDIO_FFT - 1))
+                        for i in range(AUDIO_FFT)]
+        self._edges = self._band_edges()
+        self._smooth = [0.0] * self.bands
+        self._peaks = [0.0] * self.bands
+        self._level = 0.0
+        # Silence has to persist before it counts. An analog loopback never
+        # reads a true zero -- this machine idles around -55 dBFS -- and a rest
+        # between two phrases is not the end of the music, so a bare threshold
+        # would flip the display into its idle animation mid-track.
+        self._quiet_since = None
+        # The measured noise floor, as a sliding minimum. An analog loopback
+        # never reads a true zero -- this machine idles near -55 dBFS -- and
+        # how far above zero it sits is a property of the hardware, so it is
+        # learned rather than hardcoded. Getting this wrong is not cosmetic:
+        # with auto-gain riding, a floor mistaken for signal is amplified into
+        # a full display of nothing, and the idle sweep never appears.
+        self._floor = None
+        self._floor_candidate = None
+        self._floor_rotated = 0.0
+        # Auto-gain, in dB. The sink monitor is *post-volume*: at 24% system
+        # volume -- which is where this machine actually sits -- a track that
+        # sounds normal measures around -50 dBFS, and a fixed window put the
+        # whole display one cell above the floor. Every real visualiser rides
+        # the gain for this reason. It only ever changes what the display is
+        # scaled to, never which frequencies are there.
+        self._agc = 0.0
+
+    # -- setup ----------------------------------------------------------
+
+    def _band_edges(self):
+        """Log-spaced bin ranges. Even spacing would spend most of the strip
+        on 5-11 kHz, where music has almost nothing to show."""
+        lo, hi = 40.0, min(10000.0, AUDIO_RATE / 2 - 100)
+        ratio = (hi / lo) ** (1.0 / self.bands)
+        edges = []
+        for i in range(self.bands):
+            f0, f1 = lo * ratio ** i, lo * ratio ** (i + 1)
+            k0 = max(1, int(f0 * AUDIO_FFT / AUDIO_RATE))
+            k1 = max(k0 + 1, int(f1 * AUDIO_FFT / AUDIO_RATE))
+            edges.append((k0, min(k1, AUDIO_FFT // 2), f0, f1))
+        return edges
+
+    def _source(self):
+        """The monitor of whatever sink is currently the default."""
+        override = self.params.get('source')
+        if override:
+            return str(override)
+        rc, out, _ = self.hub.session.run(['pactl', 'get-default-sink'])
+        name = (out or '').strip()
+        if rc != 0 or not name:
+            raise RuntimeError('no default sink (is PipeWire running?)')
+        return f'{name}.monitor'
+
+    def _start(self):
+        source = self._source()
+        argv = ['pw-record', '--target', source,
+                '--rate', str(AUDIO_RATE), '--channels', '1',
+                '--format', 's16', '-']
+        self._proc = self.hub.session.stream(argv)
+        self._thread = threading.Thread(target=self._reader, name='dfrd-audio',
+                                        daemon=True)
+        self._thread.start()
+        return source
+
+    # -- capture --------------------------------------------------------
+
+    def _reader(self):
+        """Own the capture pipe: refill a ring buffer, analyse at a fixed rate."""
+        ring = [0.0] * AUDIO_FFT
+        write = 0
+        chunk = 1024                       # bytes; 512 frames, ~23ms
+        next_analysis = 0.0
+        # Held locally: close() drops the feed's reference to release the pipe,
+        # and this thread must not race it into an AttributeError on None.
+        proc = self._proc
+        stdout = proc.stdout
+        # Every stream here opens with a burst: the first ~100ms measures around
+        # -7 dBFS on an idle sink, then it settles to the real floor near -60.
+        # Whatever it is -- a stale buffer, a resampler priming -- it is not the
+        # machine's audio, and letting it through both spikes the display on
+        # arrival and teaches the floor detector that silence is loud.
+        skip = int(AUDIO_RATE * AUDIO_WARMUP)
+        try:
+            while not self._stopping.is_set():
+                block = stdout.read(chunk)
+                if not block:
+                    break
+                count = len(block) // 2
+                if skip > 0:
+                    skip -= count
+                    continue
+                if count:
+                    for value in struct.unpack(f'<{count}h', block[:count * 2]):
+                        ring[write] = value / 32768.0
+                        write = (write + 1) % AUDIO_FFT
+                now = time.monotonic()
+                if now >= next_analysis:
+                    next_analysis = now + 1.0 / AUDIO_ANALYSIS_HZ
+                    self._analyse(ring, write, now)
+        except (OSError, ValueError) as exc:
+            with self._lock:
+                self._fail = f'capture ended: {exc}'
+        else:
+            if not self._stopping.is_set():
+                try:
+                    err = (proc.stderr.read(400) or b'').decode(
+                        'utf-8', 'replace').strip() if proc.stderr else ''
+                except (OSError, ValueError):
+                    err = ''
+                with self._lock:
+                    self._fail = err.splitlines()[-1] if err else 'capture ended'
+
+    def _analyse(self, ring, write, now):
+        """Ring buffer -> per-band 0..1, smoothed, with falling peak holds."""
+        ordered = ring[write:] + ring[:write]
+        rms = math.sqrt(sum(v * v for v in ordered) / AUDIO_FFT)
+        spectrum = _fft([complex(ordered[i] * self._window[i], 0.0)
+                         for i in range(AUDIO_FFT)], self._rev, self._tw)
+
+        # Attack fast, release slow: a meter that falls as quickly as it rises
+        # reads as noise. Coefficients are per-second so the look does not
+        # change with the analysis rate.
+        dt = 1.0 / AUDIO_ANALYSIS_HZ
+        attack = 1.0 - math.exp(-dt / 0.020)
+        release = 1.0 - math.exp(-dt / 0.180)
+        peak_fall = dt / 0.9
+
+        # Two passes: the band levels are measured before auto-gain is applied,
+        # so the gain is driven by the signal rather than by its own output.
+        raw = []
+        for k0, k1, f0, _f1 in self._edges:
+            power = 0.0
+            for k in range(k0, k1):
+                c = spectrum[k]
+                power += c.real * c.real + c.imag * c.imag
+            mag = math.sqrt(power) / (AUDIO_FFT / 2.0)
+            db = 20.0 * math.log10(mag + 1e-10)
+            # Music falls off with frequency, so an untilted display is a wall
+            # of bass and nothing else. +3 dB per octave above the low edge
+            # evens it out without inventing detail that is not there.
+            raw.append(db + 3.0 * math.log2(max(f0, 40.0) / 40.0) + self.gain_db)
+
+        values = []
+        for index, db in enumerate(raw):
+            value = min(1.0, max(0.0, (db + self._agc + 62.0) / 56.0))
+            previous = self._smooth[index]
+            coeff = attack if value > previous else release
+            smoothed = previous + (value - previous) * coeff
+            self._smooth[index] = smoothed
+            self._peaks[index] = (smoothed if smoothed >= self._peaks[index]
+                                  else max(smoothed, self._peaks[index] - peak_fall))
+            values.append(smoothed)
+
+        self._level += (min(1.0, rms * 6.0) - self._level) * (
+            attack if rms * 6.0 > self._level else release)
+
+        # Sliding minimum: the quietest moment in the last window or two. It
+        # cannot drift upward past the quietest thing actually heard, so a long
+        # loud passage does not teach it that loud is normal.
+        self._floor_candidate = (rms if self._floor_candidate is None
+                                 else min(self._floor_candidate, rms))
+        # The very first window is short. Until a floor exists everything looks
+        # like signal, so auto-gain winds up and the display shows amplified
+        # hiss; three seconds of that at startup is tolerable, twenty is not.
+        window = 3.0 if self._floor is None else AUDIO_FLOOR_WINDOW
+        if now - self._floor_rotated >= window:
+            self._floor_rotated = now
+            # Only believe a plausible floor. Starting the feed while music is
+            # already playing -- which is exactly when someone switches to this
+            # page -- makes the window's minimum the *music*, and a floor
+            # learned from music silences everything quieter than it. Rejecting
+            # it just defers the measurement to a window that contains a gap.
+            if self._floor_candidate is not None and \
+                    self._floor_candidate <= AUDIO_FLOOR_MAX:
+                self._floor = self._floor_candidate
+            self._floor_candidate = rms
+        floor = self._floor
+        threshold = max(AUDIO_SILENCE, (floor or 0.0) * AUDIO_FLOOR_MARGIN)
+
+        if rms >= threshold:
+            self._quiet_since = None
+        elif self._quiet_since is None:
+            self._quiet_since = now
+        silent = (self._quiet_since is not None and
+                  now - self._quiet_since >= AUDIO_SILENCE_HOLD)
+
+        if self.auto_gain and not silent and raw:
+            # Come down fast, go up slowly. A loud passage that pins every band
+            # should stop pinning them within a beat or two, but the gain must
+            # not creep up through a quiet passage and then detonate on the
+            # next chorus. Frozen while silent, so the floor is never amplified
+            # into a display of nothing.
+            wanted = AUDIO_TARGET_DB - max(raw)
+            coeff = 1.0 - math.exp(-dt / (0.25 if wanted < self._agc else 2.5))
+            self._agc += (wanted - self._agc) * coeff
+            self._agc = min(AUDIO_AGC_RANGE[1], max(AUDIO_AGC_RANGE[0], self._agc))
+
+        # Silence is reported as silence. The gain is frozen but still high
+        # from whatever last played, so the bands at this point are the noise
+        # floor multiplied by 30 dB -- a full and entirely fictional spectrum.
+        # A consumer that ignores `silent` should still not be handed that.
+        if silent:
+            values = [0.0] * self.bands
+            self._peaks = [0.0] * self.bands
+
+        with self._lock:
+            self._snapshot = {
+                'bands': [round(v, 4) for v in values],
+                'peaks': [round(v, 4) for v in self._peaks],
+                'level': round(self._level, 4),
+                'rms': round(rms, 6),
+                'silent': silent,
+                'gain_db': round(self._agc, 1),
+                'floor': round(floor or 0.0, 6),
+                'count': self.bands,
+                'at': now,
+            }
+
+    # -- Feed interface -------------------------------------------------
+
+    def fetch(self):
+        if self._proc is None:
+            source = self._start()
+            self.interval = 0.0
+            return {'bands': [0.0] * self.bands, 'peaks': [0.0] * self.bands,
+                    'level': 0.0, 'silent': True, 'count': self.bands,
+                    'source': source, 'starting': True}
+        with self._lock:
+            failure, snapshot = self._fail, dict(self._snapshot)
+        if failure:
+            # Tear the capture down and back off. Left alone this feed is asked
+            # for a value every render tick, so a dead PipeWire would raise 20
+            # times a second, and every raise bumps the revision and repaints
+            # the strip -- a failure that costs more than the feature. The next
+            # attempt rebuilds the stream, so unplugging headphones recovers.
+            self.close()
+            self._stopping.clear()
+            with self._lock:
+                self._fail = None
+            self.interval = 5.0
+            raise RuntimeError(failure)
+        if not snapshot:
+            return {'bands': [0.0] * self.bands, 'peaks': [0.0] * self.bands,
+                    'level': 0.0, 'silent': True, 'count': self.bands,
+                    'starting': True}
+        return snapshot
+
+    def close(self):
+        self._stopping.set()
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+        except Exception:                              # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:                          # noqa: BLE001
+                pass
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+
 # --- network ------------------------------------------------------------
 
 class CryptoFeed(Feed):
@@ -482,11 +850,18 @@ class WeatherFeed(Feed):
 FEED_TYPES = {cls.kind: cls for cls in (
     CpuFeed, MemoryFeed, TemperatureFeed, BatteryFeed, DiskFeed, NetworkFeed,
     VolumeFeed, BrightnessFeed, MprisFeed, WorkspacesFeed, ScriptFeed,
-    CryptoFeed, StockFeed, WeatherFeed,
+    CryptoFeed, StockFeed, WeatherFeed, AudioFeed,
 )}
 
 
 # --- hub ----------------------------------------------------------------
+
+def _safe_close(feed):
+    try:
+        feed.close()
+    except Exception:                                  # noqa: BLE001
+        pass
+
 
 class FeedHub:
     """Lazy registry of feeds, refreshed off the render thread."""
@@ -537,6 +912,7 @@ class FeedHub:
             for key, feed in list(self._feeds.items()):
                 if now - feed.last_read > IDLE_RETIRE:
                     del self._feeds[key]
+                    _safe_close(feed)
                     continue
                 if feed._inflight or now < feed._due:
                     continue
@@ -552,4 +928,8 @@ class FeedHub:
 
     def close(self):
         self._closed = True
+        with self._lock:
+            feeds, self._feeds = list(self._feeds.values()), {}
+        for feed in feeds:
+            _safe_close(feed)
         self._pool.shutdown(wait=False, cancel_futures=True)

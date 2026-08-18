@@ -134,6 +134,30 @@ class Session:
         except (OSError, ValueError) as exc:
             return False, str(exc)
 
+    def stream(self, argv):
+        """Start a long-running process as the user and keep its stdout.
+
+        `run` is for things that answer and exit, so it captures with a
+        timeout; this is for things that never stop talking -- the audio
+        monitor is the one caller. stderr is kept on a pipe rather than
+        discarded so a failure to connect to PipeWire can be reported instead
+        of showing up as an inexplicably silent visualiser.
+
+        Returns a Popen, or raises OSError. The caller owns termination.
+        """
+        kwargs = {
+            'env': self.env(),
+            'cwd': self.home,
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.PIPE,
+            'bufsize': 0,
+            'start_new_session': True,
+        }
+        if os.getuid() == 0:
+            kwargs['preexec_fn'] = self._demote()
+        return subprocess.Popen(argv, **kwargs)
+
     def hyprctl(self, *args, json_out=False):
         if not shutil.which('hyprctl'):
             return 127, '', 'hyprctl not installed'

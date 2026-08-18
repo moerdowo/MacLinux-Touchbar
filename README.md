@@ -27,13 +27,65 @@ slider, and system meters with Hyprland workspaces.*
 | Category | Widgets |
 |---|---|
 | **Basics** | Button (icon, text, image, any key or command), Text, Image (PNG/JPEG/SVG), Spacer |
-| **Live data** | Crypto price (CoinGecko), Stock ticker (Yahoo Finance), Weather (Open-Meteo), Script output |
+| **Live data** | KITT visualiser (audio spectrum), Crypto price (CoinGecko), Stock ticker (Yahoo Finance), Weather (Open-Meteo), Script output |
 | **System** | CPU, Memory, Temperature, Disk, Network throughput, Battery |
 | **Controls** | Volume slider, Brightness slider, Now playing (MPRIS), Workspaces (Hyprland) |
 | **Navigation** | Page switcher, and a reserved Escape key |
 
 Market and weather widgets need no API key. Anything not covered is a
 **Script** widget: run a command on a timer and show its first line.
+
+### KITT
+
+The `kitt` page is the visualiser on its own, filling the strip.
+
+It shows the spectrum of **what this machine is actually playing** — the
+monitor of the default sink, so every application, post-volume, and nothing
+from the microphone. It follows the default sink rather than a fixed device,
+so moving output to headphones does not freeze it.
+
+```console
+$ dfrctl page kitt
+```
+
+Mirrored from the centre with bass in the middle, drawn as discrete red cells
+with the unlit ones still visible — that grid is the point, and it is where
+the name comes from. Escape keeps its usual block at the far left, lit in the
+matrix's own colour, because in display mode Escape is drawn by dfrd or it
+does not exist at all.
+
+When nothing is playing it falls back to the Knight Rider sweep, easing at
+each turn.
+
+| Property | Default | |
+|---|---|---|
+| Bands | 48 | mirrored, so 96 columns |
+| Rows | 9 | growing from the middle row outward, or up from the floor |
+| Colour | `#ff1e0a` | one hue; heat lifts it slightly, never to orange |
+| Auto gain | on | see below |
+| Frames per second | 30 | every frame is a USB transfer |
+
+**Auto gain is on by default and matters more than it sounds.** A sink monitor
+is *post-volume*. At 24% system volume — where this machine actually sits — a
+track that sounds perfectly normal measures around −50 dBFS, and with a fixed
+scale the whole display sits one cell above the floor. The gain rides the
+signal to put the loudest band near the top, coming down fast and going up
+slowly, and it is frozen while silent so a noise floor is never amplified into
+a display of nothing.
+
+The noise floor itself is *measured*, not assumed: an analog loopback never
+reads a true zero, this machine idles near −60 dBFS, and how far above zero it
+sits is a property of the hardware. It is tracked as a sliding minimum, and a
+candidate louder than −44 dBFS is rejected rather than believed — otherwise
+switching to this page while music is already playing teaches it that the
+music is silence.
+
+Two things this deliberately does not do. It does not use numpy: the FFT is
+1024-point radix-2 in pure Python, measured at 1.7 ms, and a daemon that owns
+the Escape key should not gain a binary dependency to save 5% of one core. And
+it does not poll — PipeWire is asked once for a continuous stream and a reader
+thread owns it, so leaving the page stops the capture the same way leaving a
+crypto page stops the polling.
 
 A tap can press keys (`CTRL+C`, `F5`, media keys), run a command, open a URL,
 switch page, step volume or brightness, dispatch to Hyprland, or hand the
@@ -160,7 +212,7 @@ Three gotchas cost real time, all handled here:
 | `touchbar-mode` | root helper: switch `keyboard` ⇄ `display`, or print JSON status |
 | `dfrwidgets.py` | widget catalogue, layout solver, renderer — used by both |
 | `dfrtheme.py` | palette, typography, drawing primitives, icon catalogue |
-| `dfrfeeds.py` | threaded data sources: system, market, weather, MPRIS, script |
+| `dfrfeeds.py` | threaded data sources: system, market, weather, MPRIS, audio, script |
 | `dfractions.py` | what a tap does |
 | `dfrconfig.py` | config schema, defaults, atomic save, repair-on-load |
 | `dfripc.py` | the control socket protocol |
