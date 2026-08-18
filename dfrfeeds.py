@@ -671,17 +671,23 @@ class AudioFeed(Feed):
             values = [0.0] * self.bands
             self._peaks = [0.0] * self.bands
 
+        # While silent the snapshot is held *identical* frame to frame, rather
+        # than carrying a live timestamp and a jittering rms. The hub only
+        # bumps a feed's revision when its value actually changes, so a stable
+        # snapshot is what lets a reader stop being woken -- which is the
+        # difference between a strip that is dark and a strip that is dark and
+        # still being redrawn thirty times a second.
         with self._lock:
             self._snapshot = {
                 'bands': [round(v, 4) for v in values],
                 'peaks': [round(v, 4) for v in self._peaks],
-                'level': round(self._level, 4),
-                'rms': round(rms, 6),
+                'level': 0.0 if silent else round(self._level, 4),
+                'rms': 0.0 if silent else round(rms, 6),
                 'silent': silent,
                 'gain_db': round(self._agc, 1),
                 'floor': round(floor or 0.0, 6),
                 'count': self.bands,
-                'at': now,
+                'at': 0.0 if silent else now,
             }
 
     # -- Feed interface -------------------------------------------------

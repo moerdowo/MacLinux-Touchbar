@@ -54,14 +54,26 @@ the name comes from. Escape keeps its usual block at the far left, lit in the
 matrix's own colour, because in display mode Escape is drawn by dfrd or it
 does not exist at all.
 
-When nothing is playing it falls back to the Knight Rider sweep, easing at
-each turn.
+When nothing is playing, **When silent** decides what happens:
+
+| | |
+|---|---|
+| `sweep` | the Knight Rider scan, easing at each turn (default) |
+| `grid` | the unlit matrix, still visible, not moving |
+| `dark` | nothing at all — the strip goes dark |
+
+`dark` really does stop: the transition is pushed once to clear the strip and
+then nothing is pushed, the widget stops asking to be repainted, and the feed
+holds its snapshot identical so nothing wakes it. It costs no USB and no
+drawing until a sound starts. The capture itself keeps running, because that
+is what notices the sound.
 
 | Property | Default | |
 |---|---|---|
 | Bands | 48 | mirrored, so 96 columns |
 | Rows | 9 | growing from the middle row outward, or up from the floor |
 | Colour | `#ff1e0a` | one hue; heat lifts it slightly, never to orange |
+| When silent | sweep | `sweep`, `grid` or `dark` |
 | Auto gain | on | see below |
 | Frames per second | 30 | every frame is a USB transfer |
 

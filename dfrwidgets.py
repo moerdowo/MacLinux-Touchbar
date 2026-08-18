@@ -1199,8 +1199,9 @@ class KittWidget(Widget):
               help='Cells light outward from the middle row, or up from the floor'),
         field('color', 'Colour', 'color', '#ff1e0a'),
         field('peaks', 'Peak hold', 'bool', True),
-        field('idle_scan', 'Sweep when silent', 'bool', True,
-              help='The Knight Rider scan, when nothing is playing'),
+        field('when_silent', 'When silent', 'choice', 'sweep',
+              options=['sweep', 'grid', 'dark'],
+              help='Knight Rider scan, unlit matrix, or nothing at all'),
         field('auto_gain', 'Auto gain', 'bool', True,
               help='Ride the level so quiet system volume still fills the strip'),
         field('gain', 'Gain dB', 'int', 0, min=-12, max=24,
@@ -1213,6 +1214,19 @@ class KittWidget(Widget):
         super().__init__(spec)
         self._previous = None
         self._damage = None
+        self._dark = False
+
+    def silent_style(self):
+        """What to show when nothing is playing.
+
+        `idle_scan` was a bool before there were three answers; a config
+        written against it still means what it said.
+        """
+        if self.props.get('when_silent'):
+            return str(self.props['when_silent'])
+        if 'idle_scan' in self.props and not self.flag('idle_scan', True):
+            return 'grid'
+        return str(self.prop('when_silent', 'sweep'))
 
     def feeds(self):
         return [('audio', {'bands': int(self.num('bands', 48)),
@@ -1222,6 +1236,14 @@ class KittWidget(Widget):
     def tick_interval(self):
         # Animation, not data: the sweep has to move while the feed is silent
         # and unchanging, so this widget asks to be repainted on a clock.
+        #
+        # Except when it is dark, where there is nothing to animate and asking
+        # for 30 repaints a second would clear a strip-wide rectangle into the
+        # framebuffer thirty times a second to no effect. Silence makes the
+        # feed's snapshot stop changing too, so with no clock either the widget
+        # goes properly idle -- no CPU, no USB -- until a sound restarts it.
+        if self._dark:
+            return None
         return 1.0 / max(10.0, min(60.0, self.num('fps', 30)))
 
     # -- colour ---------------------------------------------------------
@@ -1300,16 +1322,24 @@ class KittWidget(Widget):
         levels = (rows + 1) // 2 if centre_grow else rows
         middle = (rows - 1) / 2.0
 
+        style = self.silent_style() if silent else 'sweep'
+        dark = silent and style == 'dark'
         scan = None
-        if silent and self.flag('idle_scan', True):
+        if silent and style == 'sweep':
             scan = self._scan_position(env, count)
+
+        # Nothing is playing and this page is set to go dark. Widget.draw has
+        # already cleared to the background, so the strip is dark by having
+        # drawn nothing -- and the signature below still runs, so the first
+        # dark frame is pushed once and the ones after it are not pushed at all.
+        self._dark = dark
 
         for ci in range(count):
             value = columns[ci] if scan is None else 0.0
             peak = peak_columns[ci] if (peak_columns and scan is None) else None
             cx = x + ci * cell_w
             signature = []
-            for ri in range(rows):
+            for ri in range(rows) if not dark else ():
                 distance = abs(ri - middle)
                 # 0 at the middle row, or 0 at the floor.
                 step = int(distance + 0.5) if centre_grow else rows - 1 - ri
@@ -1377,6 +1407,18 @@ class KittWidget(Widget):
 
     def damage(self):
         return self._damage
+
+    def draw(self, ctx, env):
+        # Skip the clear once the strip is already dark and still is. The
+        # clear is a strip-wide fill straight into the framebuffer, which is
+        # write-combined memory and costs far more than it looks; repeating it
+        # to paint black over black is the one case worth catching.
+        if self._dark and self._previous is not None:
+            data = env.feed(*self.feeds()[0][:1], **self.feeds()[0][1])
+            if data.get('silent') and self.silent_style() == 'dark':
+                self._damage = (self.x, self.y, 0.0, 0.0)
+                return
+        super().draw(ctx, env)
 
     # -- the idle sweep -------------------------------------------------
 
