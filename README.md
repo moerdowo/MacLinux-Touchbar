@@ -257,7 +257,7 @@ Three gotchas cost real time, all handled here:
 |---|---|
 | `dfr-editor` | GTK4/libadwaita designer: preview, palette, properties, theme |
 | `dfrd` | the daemon: pages, widgets, touch, uinput, control socket |
-| `dfrctl` | CLI: status, mode, page, reload, screenshot, catalogues (JSON) |
+| `dfrctl` | CLI: status, mode, page, dim, reload, screenshot, catalogues (JSON) |
 | `touchbar-mode` | root helper: switch `keyboard` ⇄ `display`, or print JSON status |
 | `dfrwidgets.py` | widget catalogue, layout solver, renderer — used by both |
 | `dfrtheme.py` | palette, typography, drawing primitives, icon catalogue |
@@ -318,4 +318,10 @@ dfrd --probe-touch       raw touch coordinates, to calibrate flips
 dfrd --render out.png    render the current config without any hardware
 dfrctl screenshot s.png  what the strip is showing right now
 dfrctl widgets           the whole catalogue with property schemas, as JSON
+dfrctl dim               blank the strip now; a touch wakes it again
 ```
+
+`dim` is the film-watching button, not a setting: it blanks the panel until
+something touches it, and leaves `dim_after` alone. It is safe to expose to a
+bar widget because the wake is unconditional — the daemon swallows the first
+press after a blank, so the strip is always one tap from its Escape key.

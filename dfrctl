@@ -10,6 +10,7 @@ find out that something is simply unavailable.
     dfrctl mode display        switch the strip into display mode (root)
     dfrctl mode keyboard       hand it back to the firmware (root)
     dfrctl page media          switch the running daemon to a page
+    dfrctl dim [on|off|toggle] blank the strip now; a touch always wakes it
     dfrctl reload              re-read the config file
     dfrctl screenshot out.png  what the strip shows right now
     dfrctl widgets             the widget catalogue, JSON
@@ -86,6 +87,10 @@ def cmd_page(args):
     return emit(dfripc.Client().set_page(args.page))
 
 
+def cmd_dim(args):
+    return emit(dfripc.Client().dim(args.state))
+
+
 def cmd_reload(args):
     return emit(dfripc.Client().reload())
 
@@ -139,6 +144,11 @@ def main():
     page = sub.add_parser('page')
     page.add_argument('page', help='page id, or +1 / -1')
     page.set_defaults(func=cmd_page)
+
+    dim = sub.add_parser('dim')
+    dim.add_argument('state', nargs='?', default='toggle',
+                     choices=['on', 'off', 'toggle'])
+    dim.set_defaults(func=cmd_dim)
 
     sub.add_parser('reload').set_defaults(func=cmd_reload)
 

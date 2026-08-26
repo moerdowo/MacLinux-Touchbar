@@ -416,6 +416,23 @@ class Daemon:
         if cmd == 'page':
             ok, message = self.switch_page(request.get('page', '+1'))
             return {'ok': ok, 'page': message}
+        if cmd == 'dim':
+            # Transient, and deliberately not written back to the config: this
+            # is the "I am watching a film, go dark" button, not a setting.
+            # `dim_after` is the setting, and it stays whatever the config says.
+            # Safe to expose because a touch always wakes the strip again --
+            # handle_touch swallows the first press for exactly that -- so no
+            # caller can leave the panel dark with no way back to Escape.
+            want = request.get('state', 'toggle')
+            if want == 'toggle':
+                want = not self.dimmed
+            elif want in ('on', 'off'):
+                want = want == 'on'
+            else:
+                return {'ok': False, 'error': f'dim: bad state {want!r}'}
+            self.dim(bool(want))
+            self.last_touch = time.monotonic()
+            return {'ok': True, 'dimmed': self.dimmed}
         if cmd == 'screenshot':
             return {'ok': True, 'png_base64': self.render_png()}
         if cmd == 'quit':

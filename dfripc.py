@@ -196,5 +196,8 @@ class Client:
     def set_page(self, page):
         return self.call('page', page=page)
 
+    def dim(self, state='toggle'):
+        return self.call('dim', state=state)
+
     def screenshot(self):
         return self.call('screenshot')
