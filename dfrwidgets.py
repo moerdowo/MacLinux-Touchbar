@@ -1184,6 +1184,12 @@ class KittWidget(Widget):
     that puts the loudest, slowest-moving part of the signal at the far edges,
     where it reads as the strip breathing, and leaves the fine detail in the
     middle where there is room for it.
+
+    **Listen to the output** turns the measuring half off. What is left is the
+    idle animation -- the Knight Rider sweep, by default -- on a widget that
+    opens no capture at all: two pages can then carry one of these each, one
+    that answers the music and one that just sweeps, and only the first of them
+    is ever attached to the sink monitor.
     """
     TYPE, LABEL, ICON = 'kitt', 'KITT visualiser', 'music'
     CATEGORY = 'Live data'
@@ -1200,6 +1206,9 @@ class KittWidget(Widget):
               help='Cells light outward from the middle row, or up from the floor'),
         field('color', 'Colour', 'color', '#ff1e0a'),
         field('peaks', 'Peak hold', 'bool', True),
+        field('listen', 'Listen to the output', 'bool', True,
+              help='Off never opens a capture: the widget only ever draws '
+                   'what "When silent" says'),
         field('when_silent', 'When silent', 'choice', 'sweep',
               options=['sweep', 'grid', 'dark'],
               help='Knight Rider scan, unlit matrix, or nothing at all'),
@@ -1229,10 +1238,28 @@ class KittWidget(Widget):
             return 'grid'
         return str(self.prop('when_silent', 'sweep'))
 
+    def listening(self):
+        return self.flag('listen', True)
+
     def feeds(self):
+        # Not listening means not capturing. The hub retires a feed nobody
+        # asks for, so returning nothing here is what actually closes parec on
+        # the sink monitor -- rather than holding the capture open and
+        # throwing away what it sends, which would still keep the sink RUNNING
+        # for everything else that reads that as "sound is playing".
+        if not self.listening():
+            return []
         return [('audio', {'bands': int(self.num('bands', 48)),
                            'gain': int(self.num('gain', 0)),
                            'auto_gain': bool(self.flag('auto_gain', True))})]
+
+    def audio(self, env):
+        """The spectrum, or a stand-in that says silence when not listening."""
+        specs = self.feeds()
+        if not specs:
+            return {'silent': True, '_ok': True}
+        kind, params = specs[0]
+        return env.feed(kind, **params)
 
     def tick_interval(self):
         # Animation, not data: the sweep has to move while the feed is silent
@@ -1286,7 +1313,7 @@ class KittWidget(Widget):
         return list(values) + list(reversed(values))
 
     def draw_content(self, ctx, env):
-        data = env.feed(*self.feeds()[0][:1], **self.feeds()[0][1])
+        data = self.audio(env)
         x, y, w, h = self.inner()
         base = T.parse_color(self.prop('color', '#ff1e0a'), (1.0, 0.12, 0.04, 1.0))
         rows = max(3, min(11, int(self.num('rows', 9))))
@@ -1416,7 +1443,7 @@ class KittWidget(Widget):
         # write-combined memory and costs far more than it looks; repeating it
         # to paint black over black is the one case worth catching.
         if self._dark and self._previous is not None:
-            data = env.feed(*self.feeds()[0][:1], **self.feeds()[0][1])
+            data = self.audio(env)
             if data.get('silent') and self.silent_style() == 'dark':
                 self._damage = (self.x, self.y, 0.0, 0.0)
                 return

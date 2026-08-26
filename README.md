@@ -71,6 +71,19 @@ When nothing is playing, **When silent** decides what happens:
 | `grid` | the unlit matrix, still visible, not moving |
 | `dark` | nothing at all — the strip goes dark |
 
+**Listen to the output** turns the measuring half off, and then the row above
+is not what it does when silent but what it does full stop. The widget opens
+no capture at all in that state — no `parec`, nothing attached to the sink
+monitor — so a page carrying one of these costs nothing to leave up. Two pages
+can then hold one each: `kitt` that only ever sweeps, and a visualiser page
+that answers the music, with the capture running only while the second one is
+showing.
+
+That split is worth making if anything else on the machine reads the sink's
+state, because a monitor capture *keeps the sink `RUNNING`*. Something asking
+"is sound playing?" that way sees a KITT page as sound, forever, for as long
+as the page is up.
+
 `dark` really does stop: the transition is pushed once to clear the strip and
 then nothing is pushed, the widget stops asking to be repainted, and the feed
 holds its snapshot identical so nothing wakes it. It costs no USB and no
@@ -82,6 +95,7 @@ is what notices the sound.
 | Bands | 48 | mirrored, so 96 columns |
 | Rows | 9 | growing from the middle row outward, or up from the floor |
 | Colour | `#ff1e0a` | one hue; heat lifts it slightly, never to orange |
+| Listen to the output | on | off draws the idle animation and never captures |
 | When silent | sweep | `sweep`, `grid` or `dark` |
 | Auto gain | on | see below |
 | Frames per second | 30 | every frame is a USB transfer |
