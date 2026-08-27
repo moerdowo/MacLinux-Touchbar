@@ -1179,11 +1179,11 @@ class KittWidget(Widget):
     bar. Drawing the unlit cells is the point; a gradient with no grid reads as
     a progress bar, and the grid is what makes it read as hardware.
 
-    Mirrored about the centre by default, with the bass at the two outer ends
-    and the treble meeting in the middle. On a strip 2170px wide and 60 tall
-    that puts the loudest, slowest-moving part of the signal at the far edges,
-    where it reads as the strip breathing, and leaves the fine detail in the
-    middle where there is room for it.
+    Mirrored about the centre by default, with the bass in the middle and the
+    spectrum opening outward to treble at the two far ends. On a strip 2170px
+    wide and 60 tall that puts the loudest, slowest-moving part of the signal
+    where the eye already is, and lets the display grow out of the centre in
+    both directions instead of collapsing into it.
 
     **Listen to the output** turns the measuring half off. What is left is the
     idle animation -- the Knight Rider sweep, by default -- on a widget that
@@ -1198,6 +1198,8 @@ class KittWidget(Widget):
     HAS_SURFACE = False
 
     SCHEMA = [
+        field('style', 'Style', 'choice', 'led', options=['led', 'pixel'],
+              help='One colour of diode, or a green/yellow/orange/red ladder'),
         field('bands', 'Bands', 'int', 48, min=4, max=64,
               help='Mirrored, so the strip shows twice this many columns'),
         field('rows', 'Rows', 'int', 9, min=3, max=11),
@@ -1276,25 +1278,65 @@ class KittWidget(Widget):
 
     # -- colour ---------------------------------------------------------
 
-    def _ramp(self, base, heat, lit, peak=False):
-        """Cell colour. `heat` is 0..1 for how hard the diode is driven, `lit`
-        its brightness; `peak` is the hold marker sitting above the bar.
+    #: The `pixel` ladder, as (row fraction the zone starts at, colour). Four
+    #: discrete zones, not a gradient: a hardware analyser has four colours of
+    #: diode soldered in rows, and the step between them is the thing that
+    #: says "you are near the top" at a glance. A smooth green-to-red blend
+    #: reads as one long bar and loses exactly that.
+    PIXEL_ZONES = (
+        (0.00, (0.00, 0.86, 0.20)),      # green   -- the working range
+        (0.55, (0.92, 0.86, 0.00)),      # yellow  -- getting loud
+        (0.78, (1.00, 0.52, 0.00)),      # orange  -- nearly out of room
+        (0.92, (1.00, 0.13, 0.05)),      # red     -- the last row or two
+    )
 
-        One hue throughout. An LED bar is a single colour of diode driven
-        harder, so heat lifts it only slightly off red -- enough that a loud
-        band looks hotter than a quiet one, nowhere near enough to reach
-        orange. The first version of this ramp added 0.62 to green at the top
-        of the column and the whole strip came out looking like fire, which is
-        a different object with a different meaning.
+    def _zone(self, level):
+        """The `pixel` ladder's colour for a row, by how high up it sits."""
+        colour = self.PIXEL_ZONES[0][1]
+        for start, rgb in self.PIXEL_ZONES:
+            if level >= start:
+                colour = rgb
+        return colour
+
+    def _ramp(self, base, heat, lit, peak=False, level=0.0):
+        """Cell colour. `heat` is 0..1 for how hard the diode is driven, `lit`
+        its brightness, `level` how far up the column the cell sits; `peak` is
+        the hold marker above the bar.
+
+        Two looks. `led` is one hue throughout: an LED bar is a single colour
+        of diode driven harder, so heat lifts it only slightly off red --
+        enough that a loud band looks hotter than a quiet one, nowhere near
+        enough to reach orange. The first version of this ramp added 0.62 to
+        green at the top of the column and the whole strip came out looking
+        like fire, which is a different object with a different meaning.
+
+        `pixel` is the other object on purpose: colour comes from the *row*,
+        not from the signal, so the ladder stands still while the bars move
+        through it. That is what a rack analyser does, and it is why the unlit
+        cells are drawn in their own zone's colour too -- the ladder is
+        readable before anything plays, so a bar reaching orange means
+        something without having to watch it get there.
         """
+        pixel = self.prop('style', 'led') == 'pixel'
+        tint = self._zone(level) if pixel else base
+
         if lit <= 0.001:
             # The unlit diode. Visible, but only just: this is what makes the
             # matrix read as a grid of pixels rather than as empty background.
-            return (base[0] * 0.22, base[1] * 0.22, base[2] * 0.22, 0.5)
+            return (tint[0] * 0.22, tint[1] * 0.22, tint[2] * 0.22, 0.5)
         if peak:
-            # The only thing allowed to look hotter than the bar it caps.
+            # The only thing allowed to look hotter than the bar it caps. On
+            # the ladder that is its own zone washed toward white, so the
+            # marker stays legible against a red top row.
+            if pixel:
+                return (min(1.0, tint[0] + 0.35), min(1.0, tint[1] + 0.35),
+                        min(1.0, tint[2] + 0.35), 1.0)
             return (min(1.0, base[0] + 0.10), min(1.0, base[1] + 0.42),
                     min(1.0, base[2] + 0.34), 1.0)
+        if pixel:
+            # Heat only trims the brightness here; the hue belongs to the row.
+            scale = 0.55 + 0.45 * lit
+            return (tint[0] * scale, tint[1] * scale, tint[2] * scale, 1.0)
         warm = min(1.0, max(0.0, heat))
         r = min(1.0, base[0] + warm * 0.05)
         g = min(1.0, base[1] + warm * 0.24)
@@ -1307,10 +1349,13 @@ class KittWidget(Widget):
     def _columns(self, values):
         if not self.flag('mirror', True):
             return list(values)
-        # Forward on the left, reversed on the right: band 0 lands at both
-        # outer ends, so the bass drives the two edges and the treble detail
-        # meets in the middle.
-        return list(values) + list(reversed(values))
+        # Reversed on the left, forward on the right: band 0 lands at both
+        # sides of the centre, so the bass is the pair of columns in the middle
+        # and the display opens outward from there, treble reaching the two
+        # far ends. The strip is 2170px of mostly-empty desk furniture; growing
+        # out of the middle is what makes it read as one instrument rather than
+        # two meters that happen to share a rail.
+        return list(reversed(values)) + list(values)
 
     def draw_content(self, ctx, env):
         data = self.audio(env)
@@ -1408,7 +1453,8 @@ class KittWidget(Widget):
                 signature.append((lit_q, heat_q, is_peak))
 
                 colour = self._ramp(base, heat_q / CELL_STEPS,
-                                    lit_q / CELL_STEPS, peak=is_peak)
+                                    lit_q / CELL_STEPS, peak=is_peak,
+                                    level=level)
                 T.set_source(ctx, colour)
                 ctx.rectangle(cx + gap_x / 2, y + ri * cell_h + gap_y / 2,
                               max(1.0, cell_w - gap_x), max(1.0, cell_h - gap_y))

@@ -406,8 +406,20 @@ AUDIO_FLOOR_WINDOW = 20.0        # seconds the noise floor is measured over
 AUDIO_FLOOR_MARGIN = 3.2         # how far above the floor still counts as silence
 AUDIO_FLOOR_MAX = 6e-3           # a "floor" louder than this (~-44 dBFS) is music
 AUDIO_WARMUP = 0.25              # seconds of capture discarded at stream start
-AUDIO_TARGET_DB = -16.0          # where auto-gain tries to put the loudest band
-AUDIO_AGC_RANGE = (-8.0, 36.0)   # how far auto-gain may push, in dB
+# Where auto-gain parks the loudest band, and it is a *ceiling* setting rather
+# than a brightness one. The gain chases max(raw) every frame, so whatever this
+# says is where the tallest column sits permanently -- at -16 that worked out
+# to 0.82 of full scale, which on a 9-row centre-grown column lights all five
+# steps and leaves the top cell glowing on every single frame. "The bar is
+# always at max" was not a mastering problem; it was this number. At -23 the
+# loudest band sits at 0.70, the top two rows stay dark through ordinary loud
+# passages, and a transient has somewhere to go.
+AUDIO_TARGET_DB = -23.0
+# How far auto-gain may push, in dB. The bottom end has to be able to reach
+# the target or the ceiling above is a wish: a hot master measures around -6 dB
+# after the +3 dB/octave tilt, which wants -17 of gain, and the old -8 floor
+# clipped it back into the pinning this was meant to fix.
+AUDIO_AGC_RANGE = (-30.0, 36.0)
 
 
 def _fft_tables(n):

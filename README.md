@@ -77,11 +77,34 @@ opens no capture at all, so leaving one up costs nothing.
 $ dfrctl page kitt
 ```
 
-Mirrored about the centre with the **bass at the two outer ends** and the
-treble meeting in the middle, drawn as discrete red cells with the unlit ones
-still visible — that grid is the point, and it is where the name comes from. Escape keeps its usual block at the far left, lit in the
-matrix's own colour, because in display mode Escape is drawn by dfrd or it
-does not exist at all.
+Mirrored about the centre with the **bass in the middle**, opening outward to
+treble at the two far ends, drawn as discrete cells with the unlit ones still
+visible — that grid is the point, and it is where the name comes from. Escape
+keeps its usual block at the far left, lit in the matrix's own colour, because
+in display mode Escape is drawn by dfrd or it does not exist at all.
+
+**Style** picks which instrument this is:
+
+| | |
+|---|---|
+| `led` | one colour of diode, driven harder when a band is loud (default) |
+| `pixel` | a green / yellow / orange / red ladder, coloured by row |
+
+`pixel` is the rack analyser: the colour belongs to the *row*, not to the
+signal, so the ladder stands still while the bars move through it. Four
+discrete zones rather than a blend — the step between them is what says "near
+the top" at a glance, where a smooth green-to-red gradient reads as one long
+bar and loses exactly that. The unlit cells are drawn in their own zone's
+colour too, so the ladder is legible before anything plays and a bar reaching
+orange means something without having to watch it get there. Pair it with
+**Grow** `up` and 11 rows for the full effect; `led` keeps `center` and the
+red diode, which is the KITT the page is named for.
+
+![The pixel ladder](docs/visualizer-pixel.png)
+
+*`pixel` with `grow: up` and 11 rows, bass in the middle. Rendered from the
+config rather than captured live, because a screenshot of a visualiser is a
+screenshot of whatever happened to be playing.*
 
 When nothing is playing, **When silent** decides what happens:
 
@@ -112,9 +135,10 @@ is what notices the sound.
 
 | Property | Default | |
 |---|---|---|
+| Style | led | `led` one hue, or the `pixel` green-to-red ladder |
 | Bands | 48 | mirrored, so 96 columns |
 | Rows | 9 | growing from the middle row outward, or up from the floor |
-| Colour | `#ff1e0a` | one hue; heat lifts it slightly, never to orange |
+| Colour | `#ff1e0a` | `led` only; heat lifts it slightly, never to orange |
 | Listen to the output | on | off draws the idle animation and never captures |
 | When silent | sweep | `sweep`, `grid` or `dark` |
 | Auto gain | on | see below |
@@ -124,9 +148,21 @@ is what notices the sound.
 is *post-volume*. At 24% system volume — where this machine actually sits — a
 track that sounds perfectly normal measures around −50 dBFS, and with a fixed
 scale the whole display sits one cell above the floor. The gain rides the
-signal to put the loudest band near the top, coming down fast and going up
-slowly, and it is frozen while silent so a noise floor is never amplified into
-a display of nothing.
+signal to put the loudest band at a fixed height, coming down fast and going
+up slowly, and it is frozen while silent so a noise floor is never amplified
+into a display of nothing.
+
+That fixed height is a **ceiling** setting, and it is worth understanding
+before reaching for it. Because the gain chases the loudest band every frame,
+wherever the target sits is where the tallest column sits *permanently*. The
+target used to be −16 dB, which works out to 0.82 of full scale — enough to
+light every step of a nine-row column and leave the top cell glowing on every
+frame of every loud track. "The bar is always at max" was never a mastering
+problem; it was that number. It is now −23 dB, so the loudest band sits around
+0.70, the top rows stay dark through ordinary loud passages, and a transient
+has somewhere to go. The gain is also allowed 30 dB of cut rather than 8: a
+hot master measures about −6 dB after the tilt and wants −17 of gain, and the
+old floor clipped it straight back into the pinning.
 
 The noise floor itself is *measured*, not assumed: an analog loopback never
 reads a true zero, this machine idles near −60 dBFS, and how far above zero it
