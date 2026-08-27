@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from operator import mul
 
 USER_AGENT = 'dfrd/1.0 (+touchbar)'
 HTTP_TIMEOUT = 8
@@ -386,7 +387,19 @@ class ScriptFeed(Feed):
 #: cost -- and this runs on a 2016 laptop with a fragile GPU beside it.
 AUDIO_RATE = 22050
 AUDIO_FFT = 1024                 # 46ms window, 21.5 Hz per bin
-AUDIO_ANALYSIS_HZ = 60.0         # analysis cadence, independent of the render loop
+AUDIO_ANALYSIS_HZ = 60.0         # ceiling on analysis; arrivals are the real rate
+# What parec is asked to buffer, and the whole reason the visualiser is smooth.
+# Left to itself it hands over about 1.5 SECONDS at a time -- 97% of reads
+# return in under a millisecond from an already-full buffer, then the pipe goes
+# quiet for 1.5s. Since analysis is gated on the clock, only the first chunk of
+# each burst is ever looked at and the other ~58 are shovelled into the ring
+# unseen: the strip then shows one 46ms window of audio per burst, which is
+# exactly what "the animation stutters" turned out to mean. Measured on this
+# machine: 0.7 analyses/s, 1493ms apart, against 43.1/s and 21.4ms with the
+# flag. At 20ms the fragment is one 1024-byte read, so audio is real time.
+# Bigger values are worse than they look: 25 and 50 both split into two reads
+# per fragment, one waiting and one instant, and the cadence goes lumpy again.
+AUDIO_LATENCY_MS = 20
 AUDIO_SILENCE = 1.2e-3           # absolute floor under which it is always silence
 AUDIO_SILENCE_HOLD = 0.75        # seconds under the threshold before we believe it
 AUDIO_FLOOR_WINDOW = 20.0        # seconds the noise floor is measured over
@@ -414,9 +427,10 @@ def _fft(samples, rev, twiddles):
     """In-place iterative radix-2 FFT.
 
     Pure Python on purpose: numpy is not installed here and this is the only
-    thing in dfrd that would want it, so a 1024-point transform measured at
-    1.7ms -- about 5% of one core at 30fps -- is a much smaller price than a
-    dependency the daemon would then need at boot.
+    thing in dfrd that would want it, and a dependency the daemon would need
+    at boot is a worse price than the milliseconds. Measured on this machine a
+    1024-point complex transform is 1.5ms -- which is still twice what the
+    caller needs to pay; see `_rfft`.
     """
     n = len(samples)
     out = [samples[rev[i]] for i in range(n)]
@@ -432,6 +446,39 @@ def _fft(samples, rev, twiddles):
                 out[j + half] = u - t
                 k += step
         size <<= 1
+    return out
+
+
+def _rfft_tables(n):
+    """Tables for `_rfft` on `n` real samples: a half-length transform's own,
+    plus the twiddles that unpack it."""
+    rev, tw = _fft_tables(n // 2)
+    return rev, tw, [cmath.exp(-2j * math.pi * k / n) for k in range(n // 2 + 1)]
+
+
+def _rfft(samples, rev, twiddles, untwiddles):
+    """Bins 0..n/2 of a real signal, via a transform of half the length.
+
+    A real input wastes half of a complex FFT: the imaginary side is zero going
+    in and the output is symmetric coming back. Packing the even samples into
+    the real part and the odd into the imaginary runs n/2 points instead of n,
+    and the two interleaved spectra are then separated by symmetry -- the even
+    part is the half-sum with the mirrored conjugate, the odd part the
+    half-difference, recombined with one twiddle each.
+
+    Textbook, and worth the fifteen lines here: 0.8ms against 1.5ms for the
+    same 1024 samples, and this runs about 43 times a second whenever the
+    visualiser is up -- which is the difference between a 1.8ms analysis and a
+    1.1ms one, or 7% of a core rather than 11%. Verified against `_fft` on
+    random input to 3e-14, which is double precision agreeing with itself.
+    """
+    half = _fft(list(map(complex, samples[0::2], samples[1::2])), rev, twiddles)
+    n = len(half)
+    out = []
+    for k in range(n + 1):
+        a, b = half[k % n], half[(n - k) % n].conjugate()
+        # even-sample spectrum, odd-sample spectrum, recombined
+        out.append((a + b) * 0.5 + untwiddles[k] * ((a - b) * -0.5j))
     return out
 
 
@@ -464,12 +511,15 @@ class AudioFeed(Feed):
         self._stopping = threading.Event()
         self._snapshot = {}
         self._fail = None
-        self._rev, self._tw = _fft_tables(AUDIO_FFT)
+        self._rev, self._tw, self._untw = _rfft_tables(AUDIO_FFT)
         self._window = [0.5 - 0.5 * math.cos(2 * math.pi * i / (AUDIO_FFT - 1))
                         for i in range(AUDIO_FFT)]
         self._edges = self._band_edges()
         self._smooth = [0.0] * self.bands
         self._peaks = [0.0] * self.bands
+        # When the last analysis ran, so the smoothing can use the interval it
+        # actually got rather than the one it hoped for. See `_analyse`.
+        self._last_analysis = None
         self._level = 0.0
         # Silence has to persist before it counts. An analog loopback never
         # reads a true zero -- this machine idles around -55 dBFS -- and a rest
@@ -565,7 +615,8 @@ class AudioFeed(Feed):
             raise RuntimeError('parec not found (install pipewire-pulse); '
                                'pw-record cannot capture a sink monitor')
         argv = ['parec', '-d', source, f'--rate={AUDIO_RATE}',
-                '--channels=1', '--format=s16le', '--raw']
+                '--channels=1', '--format=s16le', '--raw',
+                f'--latency-msec={AUDIO_LATENCY_MS}']
         self._proc = self.hub.session.stream(argv)
 
         # And then check where it landed. Capturing the wrong device is the one
@@ -634,14 +685,28 @@ class AudioFeed(Feed):
     def _analyse(self, ring, write, now):
         """Ring buffer -> per-band 0..1, smoothed, with falling peak holds."""
         ordered = ring[write:] + ring[:write]
-        rms = math.sqrt(sum(v * v for v in ordered) / AUDIO_FFT)
-        spectrum = _fft([complex(ordered[i] * self._window[i], 0.0)
-                         for i in range(AUDIO_FFT)], self._rev, self._tw)
+        # map/mul rather than a comprehension: both of these run on every
+        # analysis, and at C speed they cost a third of what the loop did.
+        rms = math.sqrt(sum(map(mul, ordered, ordered)) / AUDIO_FFT)
+        spectrum = _rfft(list(map(mul, ordered, self._window)),
+                         self._rev, self._tw, self._untw)
 
         # Attack fast, release slow: a meter that falls as quickly as it rises
-        # reads as noise. Coefficients are per-second so the look does not
-        # change with the analysis rate.
-        dt = 1.0 / AUDIO_ANALYSIS_HZ
+        # reads as noise.
+        #
+        # `dt` is the interval this analysis actually got, not the nominal one.
+        # They are not the same thing and assuming they were hid a real fault:
+        # the coefficients were computed for 60Hz while parec was handing over
+        # 1.5 seconds at a time, so the meter crawled 1/90th of the way toward
+        # each new value and then waited a second and a half to do it again.
+        # Measuring the interval makes the claim above -- that the look does
+        # not change with the analysis rate -- true rather than aspirational.
+        # Capped, because a stalled capture must not produce a coefficient
+        # from an interval measured in minutes.
+        previous = self._last_analysis
+        self._last_analysis = now
+        dt = (min(0.25, now - previous) if previous is not None
+              else 1.0 / AUDIO_ANALYSIS_HZ)
         attack = 1.0 - math.exp(-dt / 0.020)
         release = 1.0 - math.exp(-dt / 0.180)
         peak_fall = dt / 0.9
@@ -651,8 +716,8 @@ class AudioFeed(Feed):
         raw = []
         for k0, k1, f0, _f1 in self._edges:
             power = 0.0
-            for k in range(k0, k1):
-                c = spectrum[k]
+            # Iterating a slice beats indexing the list bin by bin.
+            for c in spectrum[k0:k1]:
                 power += c.real * c.real + c.imag * c.imag
             mag = math.sqrt(power) / (AUDIO_FFT / 2.0)
             db = 20.0 * math.log10(mag + 1e-10)

@@ -53,6 +53,26 @@ so moving output to headphones does not freeze it.
 > starting capture, dfrd asks `pactl` which source it actually attached to and
 > refuses anything that is not a monitor.
 
+> `parec` is asked for `--latency-msec=20`, and that one flag is the difference
+> between a visualiser and a slideshow. Left to choose for itself it hands over
+> about **1.5 seconds of audio at a time**: 97% of reads return in under a
+> millisecond from a buffer that is already full, then the pipe goes quiet.
+> Analysis is gated on the clock, so only the first chunk of each burst is ever
+> looked at and the other ~58 are shovelled into the ring unseen — one 46ms
+> window of audio drawn every 1.5 seconds. Measured here: **0.7 analyses/s with
+> 1493ms between them, against 43.1/s and 21.4ms** once the flag is on. At 20ms
+> the fragment is exactly one read, so audio arrives in real time.
+> Bigger values are worse than they look: 25 and 50 both split into two reads
+> per fragment, one waiting and one instant, and the cadence goes lumpy again.
+
+**It costs about 7% of one core** while it is on screen — measured here at
+43 analyses a second, 6.6% of a 2016 i7-6700HQ — and that is what a spectrum
+costs without numpy: a 1024-point transform every 23ms. The transform is a
+real-input one, half the length of the complex FFT it replaces and recombined
+by symmetry, which took the analysis from 1.8ms to 1.1ms. The visualiser is
+only ever drawn while its page shows, and a page whose KITT is not listening
+opens no capture at all, so leaving one up costs nothing.
+
 ```console
 $ dfrctl page kitt
 ```
@@ -115,10 +135,10 @@ candidate louder than −44 dBFS is rejected rather than believed — otherwise
 switching to this page while music is already playing teaches it that the
 music is silence.
 
-Two things this deliberately does not do. It does not use numpy: the FFT is
-1024-point radix-2 in pure Python, measured at 1.7 ms, and a daemon that owns
-the Escape key should not gain a binary dependency to save 5% of one core. And
-it does not poll — PipeWire is asked once for a continuous stream and a reader
+Two things this deliberately does not do. It does not use numpy: the transform
+is radix-2 in pure Python over 1024 real samples, measured at 0.8 ms inside a
+1.1 ms analysis, and a daemon that owns the Escape key should not gain a binary
+dependency to save 7% of one core. And it does not poll — PipeWire is asked once for a continuous stream and a reader
 thread owns it, so leaving the page stops the capture the same way leaving a
 crypto page stops the polling.
 
