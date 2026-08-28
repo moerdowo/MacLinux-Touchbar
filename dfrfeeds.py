@@ -278,11 +278,12 @@ class MprisFeed(Feed):
             return conn
         import gi
         gi.require_version('Gio', '2.0')
-        from gi.repository import Gio
+        from gi.repository import Gio, GLib
         address = self.hub.session.bus_address
         if not address:
             raise RuntimeError('no session bus')
         self._gio = Gio
+        self._glib = GLib
         self._conn = Gio.DBusConnection.new_for_address_sync(
             address,
             Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
@@ -296,7 +297,7 @@ class MprisFeed(Feed):
 
     def fetch(self):
         conn = self._connection()
-        Gio = self._gio
+        GLib = self._glib
         names = self._call(conn, 'org.freedesktop.DBus', 'org.freedesktop.DBus',
                            '/org/freedesktop/DBus', 'ListNames', None)[0]
         players = [n for n in names if n.startswith('org.mpris.MediaPlayer2.')]
@@ -313,7 +314,7 @@ class MprisFeed(Feed):
                 props = self._call(
                     conn, name, 'org.freedesktop.DBus.Properties',
                     '/org/mpris/MediaPlayer2', 'GetAll',
-                    Gio.Variant('(s)', ('org.mpris.MediaPlayer2.Player',)))[0]
+                    GLib.Variant('(s)', ('org.mpris.MediaPlayer2.Player',)))[0]
             except Exception:                          # noqa: BLE001
                 continue
             meta = props.get('Metadata') or {}
