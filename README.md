@@ -16,11 +16,12 @@ dfrctl            drive it from scripts
 The programs keep the short `dfr*` names throughout — `dfrd` is the daemon,
 and `~/.config/dfrd/` is where its config lives.
 
-![Four pages on the Touch Bar](docs/strip-pages.png)
+![Six pages on the Touch Bar](docs/strip-pages.png)
 
-*The four stock pages, captured from the running daemon with `dfrctl
-screenshot`: launchers and a BTC ticker, the F-keys, media with a volume
-slider, and system meters with Hyprland workspaces.*
+*The six stock pages, captured with `dfrctl screenshot`: launchers with system
+readouts and market tickers, the F-keys, now playing with transport and volume,
+the `kitt` page that only ever sweeps, the visualiser answering the music, and
+system meters with Hyprland workspaces.*
 
 ## What you can put on the strip
 
